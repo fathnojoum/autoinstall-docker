@@ -14,16 +14,16 @@ fi
 echo "=== STOP SEMUA CONTAINER ==="
 if command -v docker >/dev/null; then
   docker ps -q | xargs -r docker stop || true
-  echo "✅ Semua container sudah dihentikan."
+  docker ps -aq | xargs -r docker rm || true
+  echo "✅ Semua container sudah dihentikan & dihapus."
 else
-  echo "⚠️ Docker tidak ditemukan, skip stop container."
+  echo "⚠️ Docker tidak ditemukan, skip stop dan hapus container."
 fi
 
 echo "=== PILIHAN: HAPUS SEMUA VOLUME ATAU TIDAK ==="
 if command -v docker >/dev/null; then
   read -p "Apakah Anda ingin menghapus semua Docker volume? (y/n): " DEL_VOL
   if [ "$DEL_VOL" = "y" ]; then
-    docker ps -aq | xargs -r docker rm || true
     docker volume ls -q | xargs -r docker volume rm || true
     echo "✅ Semua volume Docker telah dihapus."
   else
@@ -31,7 +31,7 @@ if command -v docker >/dev/null; then
   fi
   docker images -q | xargs -r docker rmi -f || true
   docker network ls --filter "type=custom" -q | xargs -r docker network rm || true
-  echo "✅ Semua container, image, dan network lainnya sudah dihapus."
+  echo "✅ Semua image dan network Docker sudah dihapus."
 else
   echo "⚠️ Docker tidak ditemukan, skip penghapusan resource."
 fi
@@ -48,9 +48,10 @@ echo "✅ Semua paket docker, compose, dan buildx sudah di-uninstall."
 
 echo "=== HAPUS FILE DAN KONFIG DOCKER (Kecuali docker-compose.yml/yaml) ==="
 find / -type f \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \) \
-  -not -path "/proc/*" -not -path "/sys/*" -not -path "/snap/*" -print > /tmp/compose_files.txt
+  -not -path "/proc/*" -not -path "/sys/*" -not -path "/snap/*" -print 2>/dev/null > /tmp/compose_files.txt
 
 rm -rf \
+  /var/lib/docker \
   /var/lib/containerd \
   /etc/docker \
   /etc/systemd/system/docker.service.d \
@@ -65,7 +66,7 @@ echo
 echo "=== VERIFIKASI & LIST FILE docker-compose yang Aman ==="
 echo "Berikut adalah daftar file docker-compose.yml/yaml yang tetap aman dan tidak dihapus:"
 echo
-cat /tmp/compose_files.txt | while read file; do
+cat /tmp/compose_files.txt | while read -r file; do
   if [ -f "$file" ]; then
     echo "  - $file"
   fi
