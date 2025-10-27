@@ -50,7 +50,11 @@ sudo apt install -y \
   docker-compose-plugin \
   docker-ce-rootless-extras \
   pigz \
-  docker-buildx-plugin
+  docker-buildx-plugin \
+  slirp4netns \
+  cgroupfs-mount \
+  cgroup-lite \
+  docker-model-plugin
 echo "✅ Semua paket utama & rekomendasi Docker sudah diinstal."
 
 echo "=== (Opsional) Menambahkan user ke grup docker ==="
