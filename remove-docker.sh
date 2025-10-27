@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Deteksi OS untuk log awal
+echo "=== Deteksi OS ==="
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_INFO=$ID
