@@ -41,17 +41,26 @@ echo \
   | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 echo "✅ Repository Docker berhasil ditambahkan."
 
-echo "=== Update repository dan instal Docker + Compose plugin ==="
+echo "=== Update repository dan instal Docker + Compose plugin + recommended ==="
 sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-echo "✅ Docker dan Compose plugin berhasil diinstal."
+sudo apt install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-compose-plugin \
+  docker-ce-rootless-extras \
+  pigz \
+  docker-buildx-plugin
+echo "✅ Semua paket utama & rekomendasi Docker sudah diinstal."
 
 echo "=== (Opsional) Menambahkan user ke grup docker ==="
 sudo usermod -aG docker $USER
 echo "✅ User sudah ditambahkan ke grup docker (logout/login agar efek berlaku)."
 
-echo "=== Verifikasi versi docker dan docker compose ==="
-docker --version && docker compose version
+echo "=== Verifikasi versi docker, compose, dan buildx ==="
+docker --version
+docker compose version
+docker buildx version || echo "buildx belum tersedia (aktifkan dulu dengan 'docker buildx create --use')"
 echo "✅ Verifikasi versi selesai."
 
 echo "=== Selesai! Silakan logout/login agar bisa menjalankan docker tanpa sudo ✅==="
