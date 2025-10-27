@@ -94,3 +94,9 @@ systemctl daemon-reload
 
 echo "=== FINAL EVALUASI: ==="
 if command -v docker; then
+  echo "❌ [PERINGATAN KHUSUS] MASIH ADA docker di PATH: $(command -v docker) -- silakan cek manual!"
+else
+  echo "✅ Docker SUDAH HILANG dari PATH."
+fi
+
+echo "Script selesai. Docker benar-benar dihapus secara agresif! ✅"
