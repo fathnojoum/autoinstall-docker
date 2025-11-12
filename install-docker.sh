@@ -1,82 +1,112 @@
 #!/usr/bin/env bash
 #
-# Docker Auto-Installer (Ubuntu/Debian) — latest **stable** channel
-# Usage examples:
-#   curl -fsSL https://raw.githubusercontent.com/fathnojoum/autoinstall-docker/main/install-docker.sh | sudo bash -s -- --yes
-#   wget -qO- https://raw.githubusercontent.com/fathnojoum/autoinstall-docker/main/install-docker.sh | sudo bash -s -- --yes
-#   # Or save locally and run:
-#   #   chmod +x install-docker.sh && sudo ./install-docker.sh --yes
+# Docker Auto-Installer (Ubuntu/Debian) — stable
 #
-# Author: fathnojoum (refactor by assistant)
-# Repository: https://github.com/fathnojoum/autoinstall-docker
-# Version: 2.2 (Nov 2025)
-# Notes:
-# - Installs from Docker's official **stable** APT repo to always get latest stable releases.
-# - Works when executed as a file or via `curl | bash` / `wget | bash`.
-# - Safe on systems without systemd (e.g., containers/WSL): service steps are skipped with warnings.
-# - Supports non-interactive mode via --yes / -y.
-
 set -euo pipefail
 
 # -----------------------------
-# Pretty logging
+# Pretty logging helpers
 # -----------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
-log_info() { echo -e "${GREEN}✅ $1${NC}"; }
-log_warn() { echo -e "${YELLOW}⚠️  $1${NC}"; }
-log_error() { echo -e "${RED}❌ $1${NC}"; exit 1; }
-log_step() { echo -e "${BLUE}=== $1 ===${NC}"; }
+log_info()  { echo -e "${GREEN}✅ $1${NC}"; }
+log_warn()  { echo -e "${YELLOW}⚠️  $1${NC}"; }
+log_error() { echo -e "${RED}❌ $1${NC}" ; exit 1; }
+log_step()  { echo -e "${BLUE}=== $1 ===${NC}"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 # -----------------------------
-# Parse flags
+# Defaults & args
 # -----------------------------
 AUTO_YES=0
-for arg in "$@"; do
-  case "$arg" in
+NO_START=0
+CHANNEL="stable"   # stable | test | nightly (user may change if needed)
+PIN_VERSION=""     # exact docker version to install (optional)
+SKIP_ROOTLESS=0
+
+# Use robust arg parsing
+PARAMS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
     -y|--yes) AUTO_YES=1 ;;
-    --no-start) NO_START=1 ;;   # optional: skip starting services
+    --no-start) NO_START=1 ;;
+    --channel) CHANNEL="$2"; shift ;;
+    --channel=*) CHANNEL="${1#*=}" ;;
+    --version) PIN_VERSION="$2"; shift ;;
+    --version=*) PIN_VERSION="${1#*=}" ;;
+    --skip-rootless) SKIP_ROOTLESS=1 ;;
     --) shift; break ;;
+    -h|--help)
+      cat <<'USAGE'
+Usage: install-docker.sh [options]
+
+Options:
+  -y, --yes            Non-interactive (accept prompts)
+  --no-start           Do not enable/start services (useful for containers/CI)
+  --channel CHANNEL    Docker Apt channel: stable (default), test, nightly
+  --version VERSION    Pin to a specific docker-ce version (eg "5:24.0.5~3-0~ubuntu-jammy")
+  --skip-rootless      Skip installing rootless extras
+  -h, --help           Show this help
+
+Note: This variant ALWAYS runs a hello-world functional test after install and will
+      attempt to remove the hello-world image afterwards to keep the system clean.
+USAGE
+      exit 0
+      ;;
+    *)
+      PARAMS+=("$1")
+      ;;
   esac
-  shift || true
+  shift
 done
+set -- "${PARAMS[@]:-}"
 
 # -----------------------------
-# Sudo elevation that works for file AND piped execution
+# Re-exec with sudo if necessary (supports piped input)
 # -----------------------------
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   if command_exists sudo; then
-    # If stdin is a pipe (curl|bash), re-exec from a temp file
-    if [ -p /proc/$$/fd/0 ]; then
-      tmp_script="$(mktemp)"
+    if [ ! -t 0 ]; then
+      tmp_script="$(mktemp -t install-docker.XXXXXX.sh)" || log_error "Gagal buat temp file."
       cat >"$tmp_script"
+      chmod +x "$tmp_script"
       exec sudo -E bash "$tmp_script" "$@"
     else
       exec sudo -E bash "$0" "$@"
     fi
   else
-    log_error "Script ini memerlukan root privileges dan 'sudo' tidak tersedia. Jalankan sebagai root."
+    log_error "Script memerlukan hak root dan 'sudo' tidak tersedia. Jalankan sebagai root."
   fi
 fi
+
+cleanup_tmp() {
+  [ -n "${tmp_script:-}" ] && [ -f "${tmp_script:-}" ] && rm -f "$tmp_script" || true
+}
+trap cleanup_tmp EXIT
 
 # -----------------------------
 # Real user & home (handle sudo)
 # -----------------------------
 REAL_USER="${SUDO_USER:-${USER:-root}}"
-REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
-
+REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6 || true)"
+if [ -z "$REAL_HOME" ]; then
+  if [ "$REAL_USER" = "root" ]; then
+    REAL_HOME="/root"
+  else
+    REAL_HOME="/home/$REAL_USER"
+  fi
+fi
 umask 022
 
 cat <<'BANNER'
 
-\x1b[0;34m╔════════════════════════════════════════════════╗\x1b[0;34m╔════════════════════════════════════════════════╗\x1b[0m
-\x1b[0;34m║   Docker Auto-Installer - Ubuntu/Debian       ║\x1b[0;34m║   Docker Auto-Installer - Ubuntu/Debian       ║\x1b[0m
-\x1b[0;34m║   Version: 2.2 (Nov 2025, stable channel)     ║\x1b[0;34m║   Version: 2.2 (Nov 2025, stable channel)     ║\x1b[0m
-\x1b[0;34m╚════════════════════════════════════════════════╝\x1b[0;34m╚════════════════════════════════════════════════╝\x1b[0m
+[0;34m==============================================[0m
+[0;34m  Docker Auto-Installer - Ubuntu/Debian       [0m
+[0;34m  Version: 2.2.3 (Revisi final + auto-test)   [0m
+[0;34m==============================================[0m
 
 BANNER
 
@@ -89,9 +119,15 @@ log_step "Deteksi OS"
 
 case "${ID,,}" in
   debian)
-    DOCKER_DISTRO="debian"; DOCKER_KEY_URL="https://download.docker.com/linux/debian/gpg"; OS_INFO="Debian ${VERSION_ID}" ;;
+    DOCKER_DISTRO="debian"
+    DOCKER_KEY_URL="https://download.docker.com/linux/debian/gpg"
+    OS_INFO="Debian ${VERSION_ID}"
+    ;;
   ubuntu)
-    DOCKER_DISTRO="ubuntu"; DOCKER_KEY_URL="https://download.docker.com/linux/ubuntu/gpg"; OS_INFO="Ubuntu ${VERSION_ID}" ;;
+    DOCKER_DISTRO="ubuntu"
+    DOCKER_KEY_URL="https://download.docker.com/linux/ubuntu/gpg"
+    OS_INFO="Ubuntu ${VERSION_ID}"
+    ;;
   *)
     log_error "OS terdeteksi: ${ID}. Script hanya mendukung Ubuntu dan Debian."
     ;;
@@ -102,12 +138,15 @@ if [ -z "$CODENAME" ]; then
   if command_exists lsb_release; then
     CODENAME="$(lsb_release -cs)"
   else
-    log_error "Tidak bisa menentukan codename rilis. Pastikan 'lsb-release' terpasang atau VARIABLE VERSION_CODENAME tersedia."
+    log_error "Tidak bisa menentukan codename rilis. Pastikan 'lsb-release' terpasang."
   fi
 fi
 
 log_info "OS terdeteksi: $OS_INFO (codename: $CODENAME)"
 log_info "User: $REAL_USER ($REAL_HOME)"
+log_info "Channel Docker: $CHANNEL"
+[ -n "$PIN_VERSION" ] && log_info "Pin version: $PIN_VERSION"
+log_info "Functional test: ALWAYS RUN (hello-world) — image akan dihapus setelah tes."
 
 # -----------------------------
 # If Docker exists, ask before reinstall (unless --yes)
@@ -116,15 +155,14 @@ if command_exists docker; then
   CURRENT_VERSION="$(docker --version 2>/dev/null || echo 'unknown')"
   log_warn "Docker sudah terinstal: $CURRENT_VERSION"
   if [ "${AUTO_YES}" -ne 1 ]; then
-    echo -n "Lanjutkan untuk update/reinstall? [y/N]: "
     if [ -t 0 ]; then
+      echo -n "Lanjutkan untuk update/reinstall? [y/N]: "
       read -r REPLY
     else
-      # Try to read from TTY; if not possible, default to no
       if [ -r /dev/tty ]; then
         read -r REPLY </dev/tty || REPLY=""
       else
-        REPLY=""
+        REPLY="n"
       fi
     fi
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
@@ -135,94 +173,119 @@ if command_exists docker; then
 fi
 
 # -----------------------------
-# Remove old docker packages
+# Remove old docker packages (best-effort)
 # -----------------------------
 log_step "Hapus versi lama Docker (jika ada)"
 apt-get remove -y docker docker-engine docker.io containerd runc >/dev/null 2>&1 || true
-log_info "Cleanup paket lama selesai."
+log_info "Cleanup paket lama selesai (jika ada)."
 
 # -----------------------------
-# Dependencies
+# Install dependencies
 # -----------------------------
 log_step "Update dan instal dependensi"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y || log_error "Gagal update repository. Periksa koneksi internet."
+apt-get update || log_error "Gagal update repository. Periksa koneksi internet."
 apt-get install -y --no-install-recommends \
-  ca-certificates curl gnupg \
-  lsb-release software-properties-common \
-  uidmap dbus-user-session fuse-overlayfs slirp4netns || log_error "Gagal install dependensi."
+  ca-certificates curl gnupg lsb-release software-properties-common \
+  uidmap dbus-user-session fuse-overlayfs slirp4netns >/dev/null || log_error "Gagal install dependensi."
 log_info "Dependensi berhasil diinstal."
 
 # -----------------------------
-# Add Docker official GPG key
+# Add Docker official GPG key (to keyrings)
 # -----------------------------
 log_step "Tambahkan GPG key resmi Docker"
 install -d -m 0755 /etc/apt/keyrings
-if [ -f /etc/apt/keyrings/docker.gpg ]; then
-  rm -f /etc/apt/keyrings/docker.gpg
+KEYRING_PATH="/etc/apt/keyrings/docker.gpg"
+if [ -f "$KEYRING_PATH" ]; then
+  rm -f "$KEYRING_PATH"
   log_warn "GPG key lama dihapus."
 fi
-curl -fsSL "$DOCKER_KEY_URL" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || log_error "Gagal unduh GPG key."
-chmod a+r /etc/apt/keyrings/docker.gpg
-log_info "GPG key Docker berhasil ditambahkan."
+
+curl -fsSL "$DOCKER_KEY_URL" | gpg --batch --yes --dearmor -o "$KEYRING_PATH" || log_error "Gagal unduh/convert GPG key."
+chmod a+r "$KEYRING_PATH"
+log_info "GPG key Docker berhasil ditambahkan ke $KEYRING_PATH."
 
 # -----------------------------
-# Add Docker APT repository (stable channel)
+# Add Docker APT repository (channel-aware)
 # -----------------------------
-log_step "Tambahkan repository Docker (stable)"
+log_step "Tambahkan repository Docker ($CHANNEL)"
 ARCH="$(dpkg --print-architecture)"
-REPO_LINE="deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${DOCKER_DISTRO} ${CODENAME} stable"
+REPO_LINE="deb [arch=${ARCH} signed-by=${KEYRING_PATH}] https://download.docker.com/linux/${DOCKER_DISTRO} ${CODENAME} ${CHANNEL}"
 echo "$REPO_LINE" | tee /etc/apt/sources.list.d/docker.list >/dev/null || log_error "Gagal menambahkan repository."
-log_info "Repository Docker ditambahkan: ${CODENAME} (stable)"
+log_info "Repository Docker ditambahkan: ${CODENAME} (${CHANNEL})"
 
 # -----------------------------
-# Install Docker Engine + plugins (latest stable)
+# Update & install Docker Engine + plugins
 # -----------------------------
-log_step "Update repository dan instal Docker Engine (stable)"
-apt-get update -y || log_error "Gagal update setelah menambahkan repo Docker."
-apt-get install -y --no-install-recommends \
-  docker-ce docker-ce-cli containerd.io \
-  docker-buildx-plugin docker-compose-plugin \
-  docker-ce-rootless-extras || log_error "Gagal install paket Docker."
-log_info "Docker Engine dan plugin berhasil diinstal."
+log_step "Update repository dan instal Docker Engine"
+apt-get update || log_error "Gagal update setelah menambahkan repo Docker."
 
-# -----------------------------
-# User & group config
-# -----------------------------
-log_step "Konfigurasi user dan grup"
-if id -nG "$REAL_USER" | tr ' ' '\n' | grep -qx docker; then
-  log_warn "User $REAL_USER sudah ada di grup docker."
-else
-  usermod -aG docker "$REAL_USER" || log_error "Gagal menambahkan user ke grup docker."
-  log_info "User $REAL_USER ditambahkan ke grup docker."
+CORE_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+if [ "$SKIP_ROOTLESS" -eq 0 ]; then
+  CORE_PKGS+=(docker-ce-rootless-extras)
 fi
 
-# Docker config directory
-if [ ! -d "$REAL_HOME/.docker" ]; then
-  mkdir -p "$REAL_HOME/.docker"
-  chown -R "$REAL_USER:$REAL_USER" "$REAL_HOME/.docker"
-  log_info "Folder konfigurasi dibuat: $REAL_HOME/.docker"
+if [ -n "$PIN_VERSION" ]; then
+  INSTALL_LIST=()
+  for pkg in "${CORE_PKGS[@]}"; do
+    INSTALL_LIST+=("${pkg}=${PIN_VERSION}")
+  done
+  apt-get install -y --allow-downgrades --no-install-recommends "${INSTALL_LIST[@]}" || log_error "Gagal install paket Docker (pinned version)."
+else
+  REQ_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+  apt-get install -y --no-install-recommends "${REQ_PKGS[@]}" || log_error "Gagal install paket Docker inti."
+  if [ "$SKIP_ROOTLESS" -eq 0 ]; then
+    if apt-cache show docker-ce-rootless-extras >/dev/null 2>&1; then
+      apt-get install -y docker-ce-rootless-extras || log_warn "Gagal install docker-ce-rootless-extras (opsional)."
+    else
+      log_warn "docker-ce-rootless-extras tidak tersedia untuk rilis ini; lewati."
+    fi
+  fi
+fi
+
+log_info "Docker Engine dan plugin berhasil diinstal (atau sudah tersedia)."
+
+# -----------------------------
+# Configure user & group
+# -----------------------------
+log_step "Konfigurasi user dan grup"
+if [ "$REAL_USER" != "root" ] && id -u "$REAL_USER" >/dev/null 2>&1; then
+  if id -nG "$REAL_USER" | tr ' ' '\n' | grep -qx docker; then
+    log_warn "User $REAL_USER sudah ada di grup docker."
+  else
+    usermod -aG docker "$REAL_USER" || log_warn "Gagal menambahkan user ke grup docker; jalankan 'usermod -aG docker $REAL_USER' secara manual."
+    log_info "User $REAL_USER ditambahkan ke grup docker (perlu relogin agar berlaku)."
+  fi
+else
+  log_warn "Lewati penambahan grup docker untuk user root atau user tidak ditemukan."
+fi
+
+if [ "$REAL_USER" != "root" ]; then
+  if [ ! -d "$REAL_HOME/.docker" ]; then
+    mkdir -p "$REAL_HOME/.docker"
+    chown -R "$REAL_USER:$REAL_USER" "$REAL_HOME/.docker"
+    log_info "Folder konfigurasi dibuat: $REAL_HOME/.docker"
+  fi
 fi
 
 # -----------------------------
 # Enable & start services (if systemd present)
 # -----------------------------
-log_step "Enable dan start Docker service"
+log_step "Enable dan start Docker service (jika cocok)"
 SYSTEMD_AVAILABLE=0
 if command_exists systemctl && systemctl list-unit-files >/dev/null 2>&1; then
   SYSTEMD_AVAILABLE=1
 fi
 
-# WSL detection
 WSL_ENV=0
-if grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
+if [ -f /proc/sys/kernel/osrelease ] && grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
   WSL_ENV=1
 fi
 
 if [ "${SYSTEMD_AVAILABLE}" -eq 1 ] && [ "${WSL_ENV}" -eq 0 ] && [ "${NO_START:-0}" -eq 0 ]; then
-  systemctl enable docker.service containerd.service || log_warn "Gagal enable service Docker."
-  systemctl start docker.service || log_warn "Gagal start service Docker."
-  log_info "Docker service dicoba untuk diaktifkan."
+  systemctl enable docker.service containerd.service || log_warn "Gagal enable service Docker (non-fatal)."
+  systemctl start docker.service || log_warn "Gagal start service Docker (non-fatal)."
+  log_info "Permintaan aktivasi Docker service telah dikirim ke systemd."
 else
   if [ "${WSL_ENV}" -eq 1 ]; then
     log_warn "Terdeteksi WSL: Lewati enable/start service. Gunakan pengelolaan service WSL/distro Anda."
@@ -237,11 +300,17 @@ fi
 # Verify installation
 # -----------------------------
 log_step "Verifikasi instalasi"
-echo "Docker version:" && docker --version || log_error "Docker CLI tidak ditemukan."
-echo ""; echo "Docker Compose version:" && docker compose version || log_warn "Docker Compose plugin tidak ditemukan."
-echo ""; echo "Docker Buildx version:" && docker buildx version || log_warn "Docker Buildx plugin tidak ditemukan."
+if command_exists docker; then
+  echo "Docker version:" && docker --version || true
+else
+  log_error "Docker CLI tidak ditemukan setelah instalasi."
+fi
 
-# Service status (only if systemd)
+if command_exists docker; then
+  echo ""; echo "Docker Compose (plugin) version:" && docker compose version || log_warn "Docker Compose plugin tidak ditemukan."
+  echo ""; echo "Docker Buildx version:" && docker buildx version || log_warn "Docker Buildx plugin tidak ditemukan."
+fi
+
 if [ "${SYSTEMD_AVAILABLE}" -eq 1 ]; then
   echo ""; echo "Docker service status:"
   if systemctl is-active --quiet docker.service; then
@@ -251,12 +320,57 @@ if [ "${SYSTEMD_AVAILABLE}" -eq 1 ]; then
   fi
 fi
 
-# Optional functional test (only if daemon reachable)
-if docker info >/dev/null 2>&1; then
-  ( docker run --rm hello-world >/dev/null 2>&1 && log_info "Tes container hello-world: sukses" ) || \
-  log_warn "Tes hello-world gagal (mungkin kebijakan jaringan/registri)."
+# -----------------------------
+# ALWAYS RUN functional test (hello-world) and CLEANUP
+# -----------------------------
+log_step "Menjalankan tes fungsional (hello-world) — akan selalu dicoba"
+
+# helper: try docker info; optionally attempt to start daemon once if possible
+try_docker_info() {
+  if docker info >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+if try_docker_info; then
+  DOCKER_READY=1
 else
-  log_warn "Docker daemon belum siap atau user perlu re-login agar grup docker berlaku."
+  DOCKER_READY=0
+  # If systemd available and user didn't request --no-start, try start once
+  if [ "${SYSTEMD_AVAILABLE}" -eq 1 ] && [ "${NO_START:-0}" -eq 0 ] && [ "${WSL_ENV}" -eq 0 ]; then
+    log_info "Docker daemon tidak responsif — mencoba start docker.service sekali..."
+    if systemctl start docker.service >/dev/null 2>&1; then
+      sleep 1
+      if try_docker_info; then
+        DOCKER_READY=1
+      fi
+    else
+      log_warn "Gagal memulai docker.service (non-fatal)."
+    fi
+  fi
+fi
+
+if [ "${DOCKER_READY}" -eq 1 ]; then
+  if ( docker run --rm hello-world >/dev/null 2>&1 ); then
+    log_info "Tes container hello-world: sukses"
+  else
+    log_warn "Tes hello-world gagal (mungkin kebijakan jaringan/registri atau pull error)."
+  fi
+
+  # Clean up any hello-world image that may have been pulled
+  IMAGE_ID="$(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep '^hello-world:latest ' | awk '{print $2; exit}')"
+  if [ -n "$IMAGE_ID" ]; then
+    if docker image rm -f "$IMAGE_ID" >/dev/null 2>&1; then
+      log_info "Image hello-world dihapus (bersih)."
+    else
+      log_warn "Gagal menghapus image hello-world (non-fatal)."
+    fi
+  else
+    log_info "Tidak ada image hello-world untuk dihapus."
+  fi
+else
+  log_warn "Docker daemon belum siap; lewati tes hello-world untuk menghindari gangguan."
 fi
 
 # -----------------------------
@@ -266,15 +380,18 @@ apt-get autoremove -y >/dev/null 2>&1 || true
 
 cat <<"POST"
 
-\x1b[0;34m╔════════════════════════════════════════════════╗\x1b[0;34m╔════════════════════════════════════════════════╗\x1b[0m
-\x1b[0;34m║           Post-Installation Steps             ║\x1b[0;34m║           Post-Installation Steps             ║\x1b[0m
-\x1b[0;34m╚════════════════════════════════════════════════╝\x1b[0;34m╚════════════════════════════════════════════════╝\x1b[0m
+===============================================
+           Post-Installation Steps
+===============================================
 
-1️⃣  PENTING: Logout dan login kembali agar membership grup docker aktif
-    (atau jalankan: su - "$REAL_USER")
-2️⃣  Jalankan tes cepat:   docker run --rm hello-world
-3️⃣  Cek info:             docker info
+1) PENTING: Logout dan login kembali agar membership grup docker aktif
+   (atau jalankan: su - "$REAL_USER")
+
+2) Jika ingin verifikasi manual: docker run --rm hello-world
+3) Cek info:             docker info
 
 POST
 
-log_info "Docker berhasil diinstal dari channel stable!"
+log_info "Proses instalasi selesai."
+
+exit 0
