@@ -105,7 +105,7 @@ cat <<'BANNER'
 
 [0;34m==============================================[0m
 [0;34m  Docker Auto-Installer - Ubuntu/Debian       [0m
-[0;34m  Version: 2.2.3 (Revisi final + auto-test)   [0m
+[0;34m  Version: 1.0 by Fath Nojoum                 [0m
 [0;34m==============================================[0m
 
 BANNER
@@ -378,20 +378,41 @@ fi
 # -----------------------------
 apt-get autoremove -y >/dev/null 2>&1 || true
 
-cat <<"POST"
+log_step "Membersihkan paket yang tidak diperlukan (autoremove)"
+log_info "Cleanup selesai."
 
-===============================================
-           Post-Installation Steps
-===============================================
+log_step "Menampilkan versi Docker & Docker Compose"
 
-1) PENTING: Logout dan login kembali agar membership grup docker aktif
-   (atau jalankan: su - "$REAL_USER")
+# Tampilkan versi Docker
+if command_exists docker; then
+  echo ""
+  echo "🐳 Docker version:"
+  docker --version || log_warn "Gagal menampilkan versi Docker."
+else
+  log_warn "Docker CLI tidak ditemukan."
+fi
 
-2) Jika ingin verifikasi manual: docker run --rm hello-world
-3) Cek info:             docker info
+# Tampilkan versi Docker Compose (plugin modern)
+if docker compose version >/dev/null 2>&1; then
+  echo ""
+  echo "🧩 Docker Compose version:"
+  docker compose version || log_warn "Gagal menampilkan versi Docker Compose."
+else
+  # Coba versi legacy (docker-compose binary lama)
+  if command_exists docker-compose; then
+    echo ""
+    echo "🧩 Docker Compose (legacy binary) version:"
+    docker-compose --version || log_warn "Gagal menampilkan versi docker-compose lama."
+  else
+    log_warn "Docker Compose plugin tidak ditemukan."
+  fi
+fi
 
-POST
-
-log_info "Proses instalasi selesai."
+echo ""
+log_info "✅ Proses instalasi Docker selesai dengan sukses!"
+log_info "Silakan logout & login kembali agar grup 'docker' aktif."
+echo ""
+log_info "Untuk mulai: jalankan 'docker run --rm hello-world' untuk tes manual."
+echo ""
 
 exit 0
