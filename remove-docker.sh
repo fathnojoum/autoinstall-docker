@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# remove-and-backup-docker.sh
-# Versi: 1.1 — menambahkan progress/animasi
-# Fungsi: stop -> backup volumes + compose/.env -> remove Docker -> ringkasan
-# Semua pesan berbahasa Indonesia
+# remove-and-backup-docker.sh (fixed heredoc issues)
+# Versi: 1.2 — perbaikan agar aman dipanggil via `curl | bash`
 set -euo pipefail
 
 # -------------------------
@@ -17,14 +15,10 @@ STOP_BEFORE_BACKUP=1
 # -------------------------
 # Helper: logging (Bahasa Indonesia)
 # -------------------------
-log()  { printf "✅ %s
-" "$1"; }
-info() { printf "ℹ️  %s
-" "$1"; }
-warn() { printf "⚠️  %s
-" "$1" >&2; }
-err()  { printf "❌ %s
-" "$1" >&2; exit 1; }
+log()  { printf "✅ %s\n" "$1"; }
+info() { printf "ℹ️  %s\n" "$1"; }
+warn() { printf "⚠️  %s\n" "$1" >&2; }
+err()  { printf "❌ %s\n" "$1" >&2; exit 1; }
 
 # -------------------------
 # Format timestamp (Bahasa Indonesia)
@@ -44,43 +38,30 @@ timestamp_indonesia() {
 # -------------------------
 # Progress UI helpers
 # -------------------------
-# print progress bar based on percent (0..100)
 print_progress_bar() {
   local percent=$1
   local message=${2:-""}
   local width=40
   local filled=$(( percent * width / 100 ))
   local empty=$(( width - filled ))
-  local bar=$(printf '%0.s#' $(seq 1 $filled))
-  local spaces=$(printf '%0.s-' $(seq 1 $empty))
-  printf '
-[%s%s] %3d%% %s' "$bar" "$spaces" "$percent" "$message"
+  local bar filled_s empty_s
+  filled_s=$(printf "%0.s#" $(seq 1 $filled) 2>/dev/null || true)
+  empty_s=$(printf "%0.s-" $(seq 1 $empty) 2>/dev/null || true)
+  printf "\r[%s%s] %3d%% %s" "$filled_s" "$empty_s" "$percent" "$message"
 }
 
-# spinner shown while a long-running command runs (PID passed)
 spinner_start() {
   local pid=$1
   local msg="$2"
-  local delay=0.1
-  local spin='|/-\'
+  local delay=0.12
+  local spin='|/-\\'
   while kill -0 "$pid" 2>/dev/null; do
-    for i in $(seq 0 3); do
-      printf '
-%s %s' "${spin:i:1}" "$msg"
+    for ((i=0;i<${#spin};i++)); do
+      printf "\r%s %s" "${spin:i:1}" "$msg"
       sleep $delay
     done
   done
-}
-
-# wrapper to run a command and show spinner
-run_with_spinner() {
-  local msg="$1"
-  shift
-  ("$@") &
-  local pid=$!
-  spinner_start "$pid" "$msg"
-  wait "$pid"
-  return $?
+  printf "\r"  # clear line start
 }
 
 # -------------------------
@@ -139,12 +120,8 @@ TMPDIR="$(mktemp -d -p /tmp remove-docker-backup.XXXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # -------------------------
-# STOP phase (1 step)
+# STOP phase (if requested)
 # -------------------------
-TOTAL_STEPS=1
-# we will add number of volumes & bind-only groups later to TOTAL_STEPS
-COMPLETED_STEPS=0
-
 if [ "$STOP_BEFORE_BACKUP" -eq 1 ]; then
   info "Menghentikan semua container Docker untuk konsistensi..."
   if [ "$DRY_RUN" -eq 0 ]; then
@@ -152,11 +129,6 @@ if [ "$STOP_BEFORE_BACKUP" -eq 1 ]; then
   else
     info "[DRY-RUN] docker ps -q | xargs -r docker stop"
   fi
-  COMPLETED_STEPS=$((COMPLETED_STEPS+1))
-  pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
-  print_progress_bar $pct "Stop containers"
-  printf '
-'
 fi
 
 # -------------------------
@@ -165,31 +137,41 @@ fi
 info "Membangun peta volume -> container..."
 declare -A VOL_TO_CONTAINERS
 mapfile -t ALL_CONTAINERS < <(docker ps -aq 2>/dev/null || true)
+
 for cid in "${ALL_CONTAINERS[@]:-}"; do
   mounts_json=$(docker inspect --format '{{json .Mounts}}' "$cid" 2>/dev/null || true)
   [ -z "$mounts_json" ] && continue
-  while IFS= read -r line; do
-    if [ -z "$line" ]; then continue; fi
+
+  # parse mounts_json with python (read stdin) and output lines like: volume::NAME::SOURCE
+  echo "$mounts_json" | python3 -c '
+import sys, json
+s=sys.stdin.read()
+if not s.strip():
+    sys.exit(0)
+try:
+    arr=json.loads(s)
+except Exception:
+    sys.exit(0)
+for m in arr:
+    t=m.get("Type")
+    if t=="volume":
+        name=m.get("Name") or ""
+        src=m.get("Source") or ""
+        if name:
+            print("volume::%s::%s" % (name, src))
+' 2>/dev/null | while IFS= read -r line; do
+    [ -z "$line" ] && continue
     case "$line" in
-      volume::*) volname="${line#volume::}"; volname="${volname%%::*}"; ;;
+      volume::*) volname="${line#volume::}"; volname="${volname%%::*}" ;;
       *) continue ;;
     esac
     prev="${VOL_TO_CONTAINERS[$volname]:-}"
-    if [ -z "$prev" ]; then VOL_TO_CONTAINERS["$volname"]="$cid"; else VOL_TO_CONTAINERS["$volname"]="${prev},${cid}"; fi
-  done < <(echo "$mounts_json" | python3 - <<'PY' 2>/dev/null || true
-import sys,json
-s=sys.stdin.read()
-if not s.strip(): sys.exit(0)
-arr=json.loads(s)
-for m in arr:
-    t=m.get('Type')
-    if t=='volume':
-        name=m.get('Name') or ''
-        src=m.get('Source') or ''
-        if name:
-            print('volume::'+name+'::'+src)
-PY
-)
+    if [ -z "$prev" ]; then
+      VOL_TO_CONTAINERS["$volname"]="$cid"
+    else
+      VOL_TO_CONTAINERS["$volname"]="${prev},${cid}"
+    fi
+  done
 done
 
 mapfile -t ALL_VOLUMES < <(docker volume ls -q 2>/dev/null || true)
@@ -199,21 +181,22 @@ NUM_VOLUMES=${#ALL_VOLUMES[@]}
 mapfile -t ALL_CONTAINERS2 < <(docker ps -aq 2>/dev/null || true)
 BIND_COMPOSE_COUNT=0
 for cid in "${ALL_CONTAINERS2[@]:-}"; do
-  mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}::{{.Destination}}{{"
-"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
+  mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}::{{.Destination}}{{"\n"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
   for b in "${binds[@]:-}"; do
     src="${b%%::*}"
     for f in docker-compose.yml docker-compose.yaml .env; do
-      if [ -f "${src}/${f}" ]; then BIND_COMPOSE_COUNT=$((BIND_COMPOSE_COUNT+1)); break 2; fi
+      if [ -f "${src}/${f}" ]; then
+        BIND_COMPOSE_COUNT=$((BIND_COMPOSE_COUNT+1))
+        break 2
+      fi
     done
   done
 done
 
-# Recompute TOTAL_STEPS = stop(1 if applied) + volumes + bind-only groups + removal phases (3)
+# Estimate steps for progress
 REMOVAL_PHASES=3
 TOTAL_STEPS=$(( (STOP_BEFORE_BACKUP==1?1:0) + NUM_VOLUMES + BIND_COMPOSE_COUNT + REMOVAL_PHASES ))
 COMPLETED_STEPS=0
-
 info "Total langkah yang akan dijalankan (estimasi): $TOTAL_STEPS"
 
 # -------------------------
@@ -222,7 +205,6 @@ info "Total langkah yang akan dijalankan (estimasi): $TOTAL_STEPS"
 declare -a BACKUP_SUCCESSES=()
 declare -a BACKUP_FAILURES=()
 
-# Choose archiver
 ZIP_CMD=0
 if command -v zip >/dev/null 2>&1; then ZIP_CMD=1; fi
 
@@ -259,10 +241,10 @@ for vol in "${ALL_VOLUMES[@]:-}"; do
     COMPLETED_STEPS=$((COMPLETED_STEPS+1))
     pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
     print_progress_bar $pct "Volume $vol skipped"
-    printf '
-'
+    printf "\n"
     continue
   fi
+
   appname="$vol"
   if [ -n "${VOL_TO_CONTAINERS[$vol]:-}" ]; then
     first_cid="${VOL_TO_CONTAINERS[$vol]%%,*}"
@@ -285,21 +267,18 @@ for vol in "${ALL_VOLUMES[@]:-}"; do
     BACKUP_FAILURES+=("$vol:backup-failed")
   fi
 
-  # update progress
   COMPLETED_STEPS=$((COMPLETED_STEPS+1))
   pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
   print_progress_bar $pct "Processed volume $vol"
-  printf '
-'
+  printf "\n"
 
-  # copy compose/.env from bind mounts of containers using this volume
+  # Copy docker-compose/.env from bind mounts of containers using this volume
   if [ -n "${VOL_TO_CONTAINERS[$vol]:-}" ]; then
     IFS=',' read -ra CIDSARR <<< "${VOL_TO_CONTAINERS[$vol]}"
     extras_dir="$dest_dir/extra_files_${ts}"
     [ "$DRY_RUN" -eq 0 ] && mkdir -p "$extras_dir"
     for cid in "${CIDSARR[@]}"; do
-      mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}::{{.Destination}}{{"
-"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
+      mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}::{{.Destination}}{{"\n"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
       for b in "${binds[@]:-}"; do
         src="${b%%::*}"
         for f in docker-compose.yml docker-compose.yaml .env; do
@@ -328,7 +307,6 @@ for vol in "${ALL_VOLUMES[@]:-}"; do
       rm -rf "$extras_dir" || true
     fi
   fi
-
 done
 
 # -------------------------
@@ -336,8 +314,7 @@ done
 # -------------------------
 info "Mencari dan membackup file docker-compose/.env dari bind mounts (non-volume)..."
 for cid in "${ALL_CONTAINERS2[@]:-}"; do
-  mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}::{{.Destination}}{{"
-"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
+  mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}::{{.Destination}}{{\"\n\"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
   found_any=0
   for b in "${binds[@]:-}"; do
     src="${b%%::*}"
@@ -349,13 +326,11 @@ for cid in "${ALL_CONTAINERS2[@]:-}"; do
     done
   done
   if [ "$found_any" -eq 1 ]; then
-    # one step per found container group
     COMPLETED_STEPS=$((COMPLETED_STEPS+1))
     pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
     print_progress_bar $pct "Backing up bind-compose for container $cid"
-    printf '
-'
-    # perform actual copy/archive similar to above
+    printf "\n"
+
     cname=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null || true)
     cname="${cname#/}"
     safe_app="$(safe_name "${cname:-bindfiles}")"
@@ -392,10 +367,9 @@ for cid in "${ALL_CONTAINERS2[@]:-}"; do
 done
 
 # -------------------------
-# Removal steps (3 phases) -> update progress per phase
+# Removal steps (3 phases)
 # -------------------------
 info "Memulai penghapusan resource Docker yang sudah dibackup..."
-# Phase 1: stop & remove containers, images, networks
 if [ "$DRY_RUN" -eq 0 ]; then
   docker ps -q | xargs -r docker stop >/dev/null 2>&1 || true
   docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
@@ -407,8 +381,7 @@ fi
 COMPLETED_STEPS=$((COMPLETED_STEPS+1))
 pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
 print_progress_bar $pct "Removed containers/images/networks"
-printf '
-'
+printf "\n"
 
 # Phase 2: remove volumes (skip failed)
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -430,8 +403,7 @@ fi
 COMPLETED_STEPS=$((COMPLETED_STEPS+1))
 pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
 print_progress_bar $pct "Removed volumes"
-printf '
-'
+printf "\n"
 
 # Phase 3: purge packages, remove dirs, cleanup
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -465,12 +437,11 @@ fi
 COMPLETED_STEPS=$((COMPLETED_STEPS+1))
 pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
 print_progress_bar $pct "Final cleanup"
-printf '
-'
+printf "\n"
 
 # Final prune
 if [ "$DRY_RUN" -eq 0 ]; then
-docker system prune -af --volumes >/dev/null 2>&1 || true
+  docker system prune -af --volumes >/dev/null 2>&1 || true
 fi
 
 # -------------------------
@@ -480,21 +451,18 @@ echo
 log "=== RINGKASAN BACKUP & PENGHAPUSAN ==="
 if [ "${#BACKUP_SUCCESSES[@]}" -gt 0 ]; then
   log "Backup berhasil:"
-  for f in "${BACKUP_SUCCESSES[@]}"; do printf "  - %s
-" "$f"; done
+  for f in "${BACKUP_SUCCESSES[@]}"; do printf "  - %s\n" "$f"; done
 else
   warn "Tidak ada backup berhasil tercatat."
 fi
 if [ "${#BACKUP_FAILURES[@]}" -gt 0 ]; then
   warn "Backup gagal / dilewati (periksa pesan di atas):"
-  for f in "${BACKUP_FAILURES[@]}"; do printf "  - %s
-" "$f"; done
+  for f in "${BACKUP_FAILURES[@]}"; do printf "  - %s\n" "$f"; done
 fi
 log "Folder backup utama: $BACKUP_ROOT"
 if [ -d "$BACKUP_ROOT" ]; then
   info "Contoh struktur folder backup (beberapa file):"
-  find "$BACKUP_ROOT" -maxdepth 3 -type f -printf '  - %p
-' 2>/dev/null | sed -n '1,40p' || true
+  find "$BACKUP_ROOT" -maxdepth 3 -type f -printf '  - %p\n' 2>/dev/null | sed -n '1,40p' || true
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -503,7 +471,7 @@ else
   if command -v docker >/dev/null 2>&1; then
     warn "Docker masih ditemukan di PATH: $(command -v docker) — periksa sisa manual."
   else
-    log "Docker CLI tidak ditemukan di PATH. Sistem seharusnya bersih dari Docker." 
+    log "Docker CLI tidak ditemukan di PATH. Sistem seharusnya bersih dari Docker."
   fi
 fi
 
