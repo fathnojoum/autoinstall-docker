@@ -180,15 +180,124 @@ apt-get remove -y docker docker-engine docker.io containerd runc >/dev/null 2>&1
 log_info "Cleanup paket lama selesai (jika ada)."
 
 # -----------------------------
-# Install dependencies
+# Install dependencies (robust & portable)
 # -----------------------------
-log_step "Update dan instal dependensi"
+log_step "Update dan instal dependensi (robust & portable)"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update || log_error "Gagal update repository. Periksa koneksi internet."
-apt-get install -y --no-install-recommends \
-  ca-certificates curl gnupg lsb-release software-properties-common \
-  uidmap dbus-user-session fuse-overlayfs slirp4netns >/dev/null || log_error "Gagal install dependensi."
-log_info "Dependensi berhasil diinstal."
+
+# Retry helpers
+retry_cmd() {
+  # usage: retry_cmd <tries> <sleep_seconds> -- <command...>
+  local tries=$1; shift
+  local sleep_sec=$1; shift
+  local attempt=1
+  while [ $attempt -le "$tries" ]; do
+    if "$@"; then
+      return 0
+    fi
+    log_warn "Perintah gagal (attempt $attempt/$tries). Retrying in ${sleep_sec}s..."
+    sleep "$sleep_sec"
+    attempt=$((attempt + 1))
+    sleep_sec=$((sleep_sec * 2)) # exponential backoff
+  done
+  return 1
+}
+
+# Wait for apt/dpkg lock to be free
+wait_for_apt() {
+  local max_wait=${1:-60} # seconds
+  local waited=0
+  while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    if [ "$waited" -ge "$max_wait" ]; then
+      log_error "Timeout menunggu lock apt/dpkg (menunggu > ${max_wait}s)."
+    fi
+    log_warn "Menunggu proses apt/dpkg lain selesai..."
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+# Ensure system can resolve & access repos: retry apt-get update a few times
+wait_for_apt 120
+if ! retry_cmd 4 2 -- apt-get update -o Acquire::Retries=3; then
+  log_error "Gagal melakukan 'apt-get update' setelah beberapa percobaan. Periksa koneksi/repo."
+fi
+
+# Define package lists: core (required), extra (try if present), optional (best-effort)
+CORE_DEPS=(ca-certificates curl gnupg lsb-release uidmap)
+EXTRA_DEPS=(software-properties-common)   # often absent on minimal/Armbian mirrors
+OPTIONAL_DEPS=(dbus-user-session fuse-overlayfs slirp4netns)
+
+# Helper: is package available in current apt cache?
+pkg_available() {
+  # apt-cache show returns 0 if package metadata exists
+  apt-cache show "$1" >/dev/null 2>&1
+}
+
+# Install a list, with retry & fixed-missing fallback
+_install_pkgs() {
+  local -n pkgs=$1
+  local to_install=()
+  for p in "${pkgs[@]}"; do
+    if pkg_available "$p"; then
+      to_install+=("$p")
+    else
+      log_warn "Paket tidak tersedia di repo saat ini: $p (akan dilewati)."
+    fi
+  done
+
+  if [ "${#to_install[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  wait_for_apt 120
+  # first try: normal install with retries
+  if retry_cmd 3 2 -- apt-get install -y --no-install-recommends "${to_install[@]}"; then
+    return 0
+  fi
+
+  # second attempt with --fix-missing (best-effort)
+  log_warn "Percobaan install gagal, mencoba lagi dengan --fix-missing..."
+  if apt-get install -y --no-install-recommends --fix-missing "${to_install[@]}"; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Install core packages (fail if not possible)
+if ! _install_pkgs CORE_DEPS; then
+  log_error "Gagal install paket inti: ${CORE_DEPS[*]}"
+fi
+log_info "Paket inti berhasil diinstal."
+
+# Try install extra deps (non-fatal if absent)
+if pkg_available "${EXTRA_DEPS[0]}"; then
+  if _install_pkgs EXTRA_DEPS; then
+    log_info "Paket ekstra terpasang: ${EXTRA_DEPS[*]}"
+  else
+    log_warn "Gagal menginstal paket ekstra: ${EXTRA_DEPS[*]} (non-fatal)."
+  fi
+else
+  log_warn "Paket ekstra tidak ditemukan, dilewati: ${EXTRA_DEPS[*]}"
+fi
+
+# Try install optional deps individually (non-fatal)
+for p in "${OPTIONAL_DEPS[@]}"; do
+  if pkg_available "$p"; then
+    log_step "Installing optional package: $p"
+    wait_for_apt 120
+    if ! retry_cmd 2 2 -- apt-get install -y --no-install-recommends "$p"; then
+      log_warn "Gagal install optional package $p (non-fatal)."
+    else
+      log_info "Optional package terpasang: $p"
+    fi
+  else
+    log_warn "Optional package tidak tersedia, dilewati: $p"
+  fi
+done
+
+log_info "Dependensi (yang tersedia) berhasil diinstal."
 
 # -----------------------------
 # Add Docker official GPG key (to keyrings)
