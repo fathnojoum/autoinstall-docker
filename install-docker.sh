@@ -1,3 +1,5 @@
+# contoh menyimpan ke /root/install-docker-fixed.sh
+sudo tee /root/install-docker-fixed.sh > /dev/null <<'EOF'
 #!/usr/bin/env bash
 #
 # Docker Auto-Installer (Ubuntu/Debian) — stable
@@ -190,6 +192,8 @@ retry_cmd() {
   # usage: retry_cmd <tries> <sleep_seconds> -- <command...>
   local tries=$1; shift
   local sleep_sec=$1; shift
+  # jika ada pemisah '--', buang agar tidak dieksekusi
+  if [ "${1:-}" = "--" ]; then shift; fi
   local attempt=1
   while [ $attempt -le "$tries" ]; do
     if "$@"; then
@@ -505,7 +509,7 @@ fi
 if docker compose version >/dev/null 2>&1; then
   echo ""
   echo "🧩 Docker Compose version:"
-  docker compose version || log_warn "Gagal menampilkan versi Docker Compose."
+  docker compose version || log_warn "Docker Compose plugin tidak ditemukan."
 else
   # Coba versi legacy (docker-compose binary lama)
   if command_exists docker-compose; then
@@ -525,3 +529,4 @@ log_info "Untuk mulai: jalankan 'docker run --rm hello-world' untuk tes manual."
 echo ""
 
 exit 0
+EOF
