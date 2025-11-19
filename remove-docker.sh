@@ -1,479 +1,182 @@
 #!/usr/bin/env bash
-# remove-and-backup-docker.sh (fixed heredoc issues)
-# Versi: 1.2 — perbaikan agar aman dipanggil via `curl | bash`
+# remove-and-backup-docker-fixed.sh
+# Versi: perbaikan handle empty volume names & lebih robust untuk curl|bash
 set -euo pipefail
 
-# -------------------------
-# Konfigurasi default
-# -------------------------
-BACKUP_ROOT_DEFAULT="/root/BACKUP_DOCKER"
+BACKUP_ROOT="/root/BACKUP_DOCKER"
 DRY_RUN=0
 FORCE=0
 PURGE=1
 STOP_BEFORE_BACKUP=1
 
-# -------------------------
-# Helper: logging (Bahasa Indonesia)
-# -------------------------
-log()  { printf "✅ %s\n" "$1"; }
-info() { printf "ℹ️  %s\n" "$1"; }
-warn() { printf "⚠️  %s\n" "$1" >&2; }
-err()  { printf "❌ %s\n" "$1" >&2; exit 1; }
+log(){ printf "✅ %s\n" "$1"; }
+info(){ printf "ℹ️  %s\n" "$1"; }
+warn(){ printf "⚠️  %s\n" "$1" >&2; }
+err(){ printf "❌ %s\n" "$1" >&2; exit 1; }
 
-# -------------------------
-# Format timestamp (Bahasa Indonesia)
-# -------------------------
-DAYNAME=(Senin Selasa Rabu Kamis Jumat Sabtu Minggu)
-MONTHNAME=(Januari Februari Maret April Mei Juni Juli Agustus September Oktober November Desember)
-timestamp_indonesia() {
-  local Y M D H MN IDXDAYNAME IDXMONTH dayname_idx
-  Y=$(date +%Y); M=$(date +%m); D=$(date +%d)
-  H=$(date +%H); MN=$(date +%M)
-  IDXDAYNAME=$(date +%u)
-  IDXMONTH=$((10#${M}-1))
-  dayname_idx=$((IDXDAYNAME-1))
-  printf "%s,%s%s%s_Jam%s.%s" "${DAYNAME[$dayname_idx]}" "$D" "${MONTHNAME[$IDXMONTH]}" "$Y" "$H" "$MN"
+timestamp_indonesia(){
+  DAYNAME=(Senin Selasa Rabu Kamis Jumat Sabtu Minggu)
+  MONTHNAME=(Januari Februari Maret April Mei Juni Juli Agustus September Oktober November Desember)
+  Y=$(date +%Y); M=$(date +%m); D=$(date +%d); H=$(date +%H); MN=$(date +%M)
+  IDX=$(date +%u); IDXMONTH=$((10#${M}-1)); di=$((IDX-1))
+  printf "%s,%s%s%s_Jam%s.%s" "${DAYNAME[$di]}" "$D" "${MONTHNAME[$IDXMONTH]}" "$Y" "$H" "$MN"
 }
 
-# -------------------------
-# Progress UI helpers
-# -------------------------
-print_progress_bar() {
-  local percent=$1
-  local message=${2:-""}
-  local width=40
-  local filled=$(( percent * width / 100 ))
-  local empty=$(( width - filled ))
-  local bar filled_s empty_s
+print_progress_bar(){
+  percent=$1; msg=${2:-""}
+  width=36
+  filled=$(( percent * width / 100 ))
+  empty=$(( width - filled ))
   filled_s=$(printf "%0.s#" $(seq 1 $filled) 2>/dev/null || true)
   empty_s=$(printf "%0.s-" $(seq 1 $empty) 2>/dev/null || true)
-  printf "\r[%s%s] %3d%% %s" "$filled_s" "$empty_s" "$percent" "$message"
+  printf "\r[%s%s] %3d%% %s" "$filled_s" "$empty_s" "$percent" "$msg"
 }
 
-spinner_start() {
-  local pid=$1
-  local msg="$2"
-  local delay=0.12
-  local spin='|/-\\'
-  while kill -0 "$pid" 2>/dev/null; do
-    for ((i=0;i<${#spin};i++)); do
-      printf "\r%s %s" "${spin:i:1}" "$msg"
-      sleep $delay
-    done
-  done
-  printf "\r"  # clear line start
-}
-
-# -------------------------
-# Parse CLI args
-# -------------------------
-BACKUP_ROOT="$BACKUP_ROOT_DEFAULT"
+# parse args
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run) DRY_RUN=1; shift ;;
-    --force) FORCE=1; shift ;;
-    --no-purge) PURGE=0; shift ;;
-    --backup-root) BACKUP_ROOT="$2"; shift 2 ;;
-    --backup-root=*) BACKUP_ROOT="${1#*=}"; shift ;;
-    --no-stop-before-backup) STOP_BEFORE_BACKUP=0; shift ;;
-    --stop-before-backup) STOP_BEFORE_BACKUP=1; shift ;;
-    --help|-h)
-      cat <<'USAGE'
-Usage: remove-and-backup-docker.sh [options]
-
-Options:
-  --dry-run                Tampilkan apa yang akan dilakukan, tanpa eksekusi
-  --force                  Jalankan tanpa konfirmasi interaktif
-  --no-purge               Jangan purge paket docker dari apt
-  --backup-root PATH       Lokasi tempat menyimpan backup (default /root/BACKUP_DOCKER)
-  --no-stop-before-backup  Jangan hentikan container sebelum backup
-  --stop-before-backup     Hentikan container sebelum backup (default)
-  --help                   Tampilkan pesan ini
+    --dry-run) DRY_RUN=1; shift;;
+    --force) FORCE=1; shift;;
+    --no-purge) PURGE=0; shift;;
+    --no-stop-before-backup) STOP_BEFORE_BACKUP=0; shift;;
+    --help) cat <<'USAGE'
+Usage: script [--dry-run] [--force] [--no-purge] [--no-stop-before-backup]
 USAGE
-      exit 0 ;;
-    *) err "Argumen tidak dikenal: $1" ;;
+      exit 0;;
+    *) err "Argumen tidak dikenal: $1";;
   esac
 done
 
-# -------------------------
-# Safety & prechecks
-# -------------------------
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  err "Script harus dijalankan sebagai root (gunakan sudo)."
-fi
-
-if ! command -v docker >/dev/null 2>&1; then
-  err "Docker CLI tidak ditemukan. Pastikan Docker terinstal sebelum menjalankan script ini."
-fi
+[ "$(id -u)" -eq 0 ] || err "Jalankan sebagai root (sudo)."
+command -v docker >/dev/null 2>&1 || err "Docker CLI tidak ditemukan."
 
 if [ "$DRY_RUN" -eq 0 ] && [ "$FORCE" -eq 0 ]; then
-  echo "PERINGATAN: Script ini akan membackup data Docker dan MENGHAPUS resource Docker dari sistem."
-  echo "Jika Anda yakin, jalankan kembali dengan --force atau gunakan --dry-run untuk simulasi."
+  echo "PERINGATAN: Script akan membackup data Docker dan MENGHAPUS Docker."
   read -r -p "Lanjutkan? (y/N): " ans || true
-  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-    err "Dibatalkan oleh pengguna."
-  fi
+  [[ "$ans" =~ ^[Yy]$ ]] || err "Dibatalkan oleh pengguna."
 fi
 
-mkdir -p "$BACKUP_ROOT" || err "Gagal membuat folder backup: $BACKUP_ROOT"
-TMPDIR="$(mktemp -d -p /tmp remove-docker-backup.XXXXXX)"
-trap 'rm -rf "$TMPDIR"' EXIT
+mkdir -p "$BACKUP_ROOT" || err "Gagal buat $BACKUP_ROOT"
+TMPDIR="$(mktemp -d -p /tmp rbk.XXXXXX)"; trap 'rm -rf "$TMPDIR"' EXIT
 
-# -------------------------
-# STOP phase (if requested)
-# -------------------------
+# stop containers
 if [ "$STOP_BEFORE_BACKUP" -eq 1 ]; then
-  info "Menghentikan semua container Docker untuk konsistensi..."
-  if [ "$DRY_RUN" -eq 0 ]; then
-    docker ps -q | xargs -r docker stop >/dev/null 2>&1 || warn "Beberapa container mungkin gagal dihentikan."
-  else
-    info "[DRY-RUN] docker ps -q | xargs -r docker stop"
-  fi
+  info "Menghentikan semua container..."
+  if [ "$DRY_RUN" -eq 0 ]; then docker ps -q | xargs -r docker stop >/dev/null 2>&1 || warn "Beberapa container mungkin gagal dihentikan."; else info "[DRY-RUN] stop containers"; fi
 fi
 
-# -------------------------
-# Build mapping volume -> containers
-# -------------------------
-info "Membangun peta volume -> container..."
+# build mapping volume -> containers
 declare -A VOL_TO_CONTAINERS
 mapfile -t ALL_CONTAINERS < <(docker ps -aq 2>/dev/null || true)
-
 for cid in "${ALL_CONTAINERS[@]:-}"; do
   mounts_json=$(docker inspect --format '{{json .Mounts}}' "$cid" 2>/dev/null || true)
   [ -z "$mounts_json" ] && continue
-
-  # parse mounts_json with python (read stdin) and output lines like: volume::NAME::SOURCE
-  echo "$mounts_json" | python3 -c '
+  # parse with python reading stdin (safe)
+  echo "$mounts_json" | python3 - <<'PY' 2>/dev/null | while IFS= read -r line; do
 import sys, json
 s=sys.stdin.read()
-if not s.strip():
-    sys.exit(0)
+if not s.strip(): sys.exit(0)
 try:
-    arr=json.loads(s)
-except Exception:
-    sys.exit(0)
+  arr=json.loads(s)
+except:
+  sys.exit(0)
 for m in arr:
-    t=m.get("Type")
-    if t=="volume":
-        name=m.get("Name") or ""
-        src=m.get("Source") or ""
-        if name:
-            print("volume::%s::%s" % (name, src))
-' 2>/dev/null | while IFS= read -r line; do
+  if m.get('Type')=='volume' and m.get('Name'):
+    print("volume::%s::%s" % (m.get('Name'), m.get('Source') or ""))
+PY
+  do
     [ -z "$line" ] && continue
     case "$line" in
       volume::*) volname="${line#volume::}"; volname="${volname%%::*}" ;;
       *) continue ;;
     esac
+    [ -z "$volname" ] && continue
     prev="${VOL_TO_CONTAINERS[$volname]:-}"
-    if [ -z "$prev" ]; then
-      VOL_TO_CONTAINERS["$volname"]="$cid"
-    else
-      VOL_TO_CONTAINERS["$volname"]="${prev},${cid}"
-    fi
+    if [ -z "$prev" ]; then VOL_TO_CONTAINERS["$volname"]="$cid"; else VOL_TO_CONTAINERS["$volname"]="${prev},${cid}"; fi
   done
 done
 
 mapfile -t ALL_VOLUMES < <(docker volume ls -q 2>/dev/null || true)
 NUM_VOLUMES=${#ALL_VOLUMES[@]}
+info "Ditemukan $NUM_VOLUMES volume."
 
-# Count bind-only compose files (containers with bind mounts that contain compose/.env)
-mapfile -t ALL_CONTAINERS2 < <(docker ps -aq 2>/dev/null || true)
-BIND_COMPOSE_COUNT=0
-for cid in "${ALL_CONTAINERS2[@]:-}"; do
-  mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}::{{.Destination}}{{"\n"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
-  for b in "${binds[@]:-}"; do
-    src="${b%%::*}"
-    for f in docker-compose.yml docker-compose.yaml .env; do
-      if [ -f "${src}/${f}" ]; then
-        BIND_COMPOSE_COUNT=$((BIND_COMPOSE_COUNT+1))
-        break 2
-      fi
-    done
-  done
-done
+# prepare
+declare -a BACKUP_SUCCESSES=() BACKUP_FAILURES=()
+ZIP=0; command -v zip >/dev/null 2>&1 && ZIP=1
 
-# Estimate steps for progress
-REMOVAL_PHASES=3
-TOTAL_STEPS=$(( (STOP_BEFORE_BACKUP==1?1:0) + NUM_VOLUMES + BIND_COMPOSE_COUNT + REMOVAL_PHASES ))
-COMPLETED_STEPS=0
-info "Total langkah yang akan dijalankan (estimasi): $TOTAL_STEPS"
+safe_name(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/_/g'; }
 
-# -------------------------
-# Backup volumes
-# -------------------------
-declare -a BACKUP_SUCCESSES=()
-declare -a BACKUP_FAILURES=()
-
-ZIP_CMD=0
-if command -v zip >/dev/null 2>&1; then ZIP_CMD=1; fi
-
-safe_name() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/_/g'; }
-
-backup_path_to_archive() {
-  local path="$1"; local dest_dir="$2"; local base="$3"
-  if [ "$DRY_RUN" -eq 1 ]; then
-    info "[DRY-RUN] archive: $path -> $dest_dir/${base}.$([ $ZIP_CMD -eq 1 ] && echo zip || echo tar.gz)"
-    return 0
-  fi
-  if [ ! -d "$path" ]; then return 2; fi
-  if [ "$ZIP_CMD" -eq 1 ]; then
-    tmpf="$TMPDIR/${base}.zip"
-    (cd "$path" && zip -r -q "$tmpf" .) || return 2
-    mv "$tmpf" "${dest_dir}/${base}.zip" || return 2
-    echo "${dest_dir}/${base}.zip"
-    return 0
+backup_path_to_archive(){
+  src="$1"; dest="$2"; base="$3"
+  [ "$DRY_RUN" -eq 1 ] && { info "[DRY-RUN] archive $src -> $dest/${base}"; return 0; }
+  [ -d "$src" ] || return 2
+  if [ "$ZIP" -eq 1 ]; then
+    tmpf="$TMPDIR/${base}.zip"; (cd "$src" && zip -r -q "$tmpf" .) || return 2
+    mv "$tmpf" "$dest/${base}.zip" || return 2
+    echo "$dest/${base}.zip"; return 0
   else
-    tmpf="$TMPDIR/${base}.tar.gz"
-    tar -C "$path" -czf "$tmpf" . || return 2
-    mv "$tmpf" "${dest_dir}/${base}.tar.gz" || return 2
-    echo "${dest_dir}/${base}.tar.gz"
-    return 0
+    tmpf="$TMPDIR/${base}.tar.gz"; tar -C "$src" -czf "$tmpf" . || return 2
+    mv "$tmpf" "$dest/${base}.tar.gz" || return 2
+    echo "$dest/${base}.tar.gz"; return 0
   fi
 }
 
-info "Memulai backup volume Docker (jumlah: $NUM_VOLUMES)..."
+# loop volumes
+count=0
+total=$((NUM_VOLUMES+3))
 for vol in "${ALL_VOLUMES[@]:-}"; do
-  mountpoint=$(docker volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null || true)
-  if [ -z "$mountpoint" ] || [ ! -d "$mountpoint" ]; then
-    warn "Volume $vol: mountpoint invalid/absent — dilewati."
-    BACKUP_FAILURES+=("$vol:mountpoint-invalid")
-    COMPLETED_STEPS=$((COMPLETED_STEPS+1))
-    pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
-    print_progress_bar $pct "Volume $vol skipped"
+  count=$((count+1))
+  if [ -z "$vol" ]; then
+    warn "Ditemukan nama volume kosong, dilewati."
+    BACKUP_FAILURES+=(":volname-empty")
+    print_progress_bar $((count*100/total)) "Skipped empty volume"
     printf "\n"
     continue
   fi
-
-  appname="$vol"
-  if [ -n "${VOL_TO_CONTAINERS[$vol]:-}" ]; then
-    first_cid="${VOL_TO_CONTAINERS[$vol]%%,*}"
-    cname=$(docker inspect --format '{{.Name}}' "$first_cid" 2>/dev/null || true)
-    cname="${cname#/}"
-    [ -n "$cname" ] && appname="$cname"
-  fi
-  safe_app="$(safe_name "$appname")"
-  dest_dir="$BACKUP_ROOT/$safe_app"
-  [ "$DRY_RUN" -eq 0 ] && mkdir -p "$dest_dir"
-  ts="$(timestamp_indonesia)"
-  base="backup_appdata-docker_(${safe_app}_${vol})-${ts}"
-
-  info "Backing up volume: $vol (app: $safe_app)"
-  if out=$(backup_path_to_archive "$mountpoint" "$dest_dir" "$base" 2>&1); then
-    BACKUP_SUCCESSES+=("$out")
-    info "Berhasil: $out"
-  else
-    warn "Gagal backup volume $vol"
-    BACKUP_FAILURES+=("$vol:backup-failed")
-  fi
-
-  COMPLETED_STEPS=$((COMPLETED_STEPS+1))
-  pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
-  print_progress_bar $pct "Processed volume $vol"
-  printf "\n"
-
-  # Copy docker-compose/.env from bind mounts of containers using this volume
-  if [ -n "${VOL_TO_CONTAINERS[$vol]:-}" ]; then
-    IFS=',' read -ra CIDSARR <<< "${VOL_TO_CONTAINERS[$vol]}"
-    extras_dir="$dest_dir/extra_files_${ts}"
-    [ "$DRY_RUN" -eq 0 ] && mkdir -p "$extras_dir"
-    for cid in "${CIDSARR[@]}"; do
-      mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}::{{.Destination}}{{"\n"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
-      for b in "${binds[@]:-}"; do
-        src="${b%%::*}"
-        for f in docker-compose.yml docker-compose.yaml .env; do
-          if [ -f "${src}/${f}" ]; then
-            [ "$DRY_RUN" -eq 0 ] && cp -a "${src}/${f}" "$extras_dir/" 2>/dev/null || true
-            info "Menyalin ${f} dari ${src} ke ${extras_dir}"
-          fi
-        done
-      done
-    done
-    if [ "$DRY_RUN" -eq 0 ] && [ -d "$extras_dir" ] && [ "$(ls -A "$extras_dir" 2>/dev/null || true)" ]; then
-      if [ "$ZIP_CMD" -eq 1 ]; then
-        final="${dest_dir}/${base}.zip"
-        (cd "$extras_dir" && zip -r -q "$final" .) || warn "Gagal menambahkan extra files ke $final"
-      else
-        tmp_pack="$TMPDIR/pack_${base}"
-        rm -rf "$tmp_pack" || true
-        mkdir -p "$tmp_pack"
-        (cd "$mountpoint" && tar -cf - .) | tar -C "$tmp_pack" -xf - || true
-        cp -a "$extras_dir/." "$tmp_pack/" 2>/dev/null || true
-        tmpf="$TMPDIR/${base}.tar.gz"
-        tar -C "$tmp_pack" -czf "$tmpf" . || warn "Gagal membuat tar dengan extras"
-        mv "$tmpf" "${dest_dir}/${base}.tar.gz" || warn "Gagal memindahkan tar final"
-        rm -rf "$tmp_pack" || true
-      fi
-      rm -rf "$extras_dir" || true
-    fi
-  fi
+  mountpoint=$(docker volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null || true)
+  [ -z "$mountpoint" ] || [ ! -d "$mountpoint" ] && { warn "Volume $vol: mountpoint invalid — dilewati."; BACKUP_FAILURES+=("$vol:mountpoint-invalid"); print_progress_bar $((count*100/total)) "Volume $vol skipped"; printf "\n"; continue; }
+  app="$vol"
+  if [ -n "${VOL_TO_CONTAINERS[$vol]:-}" ]; then first="${VOL_TO_CONTAINERS[$vol]%%,*}"; cname=$(docker inspect --format '{{.Name}}' "$first" 2>/dev/null || true); cname="${cname#/}"; [ -n "$cname" ] && app="$cname"; fi
+  safe_app=$(safe_name "$app"); dest="$BACKUP_ROOT/$safe_app"; [ "$DRY_RUN" -eq 0 ] && mkdir -p "$dest"
+  ts=$(timestamp_indonesia); base="backup_appdata-docker_(${safe_app}_${vol})-${ts}"
+  info "Backing up $vol -> $dest"
+  if out=$(backup_path_to_archive "$mountpoint" "$dest" "$base" 2>&1); then BACKUP_SUCCESSES+=("$out"); info "Berhasil: $out"; else warn "Gagal backup $vol"; BACKUP_FAILURES+=("$vol:backup-failed"); fi
+  print_progress_bar $((count*100/total)) "Processed $vol"; printf "\n"
 done
 
-# -------------------------
-# Backup bind-only compose/.env
-# -------------------------
-info "Mencari dan membackup file docker-compose/.env dari bind mounts (non-volume)..."
-for cid in "${ALL_CONTAINERS2[@]:-}"; do
-  mapfile -t binds < <(docker inspect --format '{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}::{{.Destination}}{{\"\n\"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
-  found_any=0
-  for b in "${binds[@]:-}"; do
-    src="${b%%::*}"
-    for f in docker-compose.yml docker-compose.yaml .env; do
-      if [ -f "${src}/${f}" ]; then
-        found_any=1
-        break 2
-      fi
-    done
-  done
-  if [ "$found_any" -eq 1 ]; then
-    COMPLETED_STEPS=$((COMPLETED_STEPS+1))
-    pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
-    print_progress_bar $pct "Backing up bind-compose for container $cid"
-    printf "\n"
+# phase remove: containers/images/networks
+print_progress_bar $(( (NUM_VOLUMES+1)*100/total )) "Removing containers/images/networks"; printf "\n"
+docker ps -q | xargs -r docker stop >/dev/null 2>&1 || true
+docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+docker images -q | xargs -r docker rmi -f >/dev/null 2>&1 || true
+docker network ls --filter "type=custom" -q | xargs -r docker network rm >/dev/null 2>&1 || true
 
-    cname=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null || true)
-    cname="${cname#/}"
-    safe_app="$(safe_name "${cname:-bindfiles}")"
-    dest_dir="$BACKUP_ROOT/$safe_app"
-    [ "$DRY_RUN" -eq 0 ] && mkdir -p "$dest_dir"
-    ts="$(timestamp_indonesia)"
-    base="backup_appdata-docker_(${safe_app}_bindfiles)-${ts}"
-    extras_dir="$TMPDIR/extras_${safe_app}_${ts}"
-    [ "$DRY_RUN" -eq 0 ] && mkdir -p "$extras_dir"
-    for b in "${binds[@]:-}"; do
-      src="${b%%::*}"
-      for f in docker-compose.yml docker-compose.yaml .env; do
-        if [ -f "${src}/${f}" ]; then
-          [ "$DRY_RUN" -eq 0 ] && cp -a "${src}/${f}" "$extras_dir/" 2>/dev/null || true
-          info "Menyalin ${f} dari ${src} ke ${extras_dir}"
-        fi
-      done
-    done
-    if [ "$DRY_RUN" -eq 0 ] && [ -d "$extras_dir" ] && [ "$(ls -A "$extras_dir" 2>/dev/null || true)" ]; then
-      if [ "$ZIP_CMD" -eq 1 ]; then
-        tmpzip="$TMPDIR/${base}.zip"
-        (cd "$extras_dir" && zip -r -q "$tmpzip" .) || true
-        mv "$tmpzip" "$dest_dir/${base}.zip" || true
-        BACKUP_SUCCESSES+=("$dest_dir/${base}.zip")
-      else
-        tmptar="$TMPDIR/${base}.tar.gz"
-        tar -C "$extras_dir" -czf "$tmptar" . || true
-        mv "$tmptar" "$dest_dir/${base}.tar.gz" || true
-        BACKUP_SUCCESSES+=("$dest_dir/${base}.tar.gz")
-      fi
-    fi
-    rm -rf "$extras_dir" || true
-  fi
+# remove volumes that were backed-up (skip failures)
+print_progress_bar $(( (NUM_VOLUMES+2)*100/total )) "Removing volumes"; printf "\n"
+mapfile -t CUR_VOLS < <(docker volume ls -q 2>/dev/null || true)
+for v in "${CUR_VOLS[@]:-}"; do
+  skip=0
+  for f in "${BACKUP_FAILURES[@]:-}"; do [[ "$f" == "$v:"* || "$f" == "$v" ]] && { skip=1; break; }; done
+  [ "$skip" -eq 1 ] && { warn "Skip rm $v (backup failed)"; continue; }
+  docker volume rm -f "$v" >/dev/null 2>&1 || true
 done
 
-# -------------------------
-# Removal steps (3 phases)
-# -------------------------
-info "Memulai penghapusan resource Docker yang sudah dibackup..."
-if [ "$DRY_RUN" -eq 0 ]; then
-  docker ps -q | xargs -r docker stop >/dev/null 2>&1 || true
-  docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
-  docker images -q | xargs -r docker rmi -f >/dev/null 2>&1 || true
-  docker network ls --filter "type=custom" -q | xargs -r docker network rm >/dev/null 2>&1 || true
-else
-  info "[DRY-RUN] stop/remove containers/images/networks"
+# final cleanup
+print_progress_bar 100 "Final cleanup"; printf "\n"
+docker system prune -af --volumes >/dev/null 2>&1 || true
+if [ "$PURGE" -eq 1 ] && command -v apt-get >/dev/null 2>&1; then
+  apt-get purge -y docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin docker.io || true
+  apt-get autoremove -y || true
 fi
-COMPLETED_STEPS=$((COMPLETED_STEPS+1))
-pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
-print_progress_bar $pct "Removed containers/images/networks"
-printf "\n"
+rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg 2>/dev/null || true
+COMMON=(/var/lib/docker /var/lib/containerd /run/docker.sock /etc/docker /etc/containerd)
+for d in "${COMMON[@]}"; do [ -e "$d" ] && rm -rf "$d" 2>/dev/null || true; done
 
-# Phase 2: remove volumes (skip failed)
-if [ "$DRY_RUN" -eq 0 ]; then
-  mapfile -t CURRENT_VOLS < <(docker volume ls -q 2>/dev/null || true)
-  for v in "${CURRENT_VOLS[@]:-}"; do
-    skip=0
-    for ff in "${BACKUP_FAILURES[@]:-}"; do
-      if [[ "$ff" == "$v:"* || "$ff" == "$v" ]]; then skip=1; break; fi
-    done
-    if [ "$skip" -eq 1 ]; then
-      warn "Melewatkan penghapusan volume $v karena backup gagal/tidak valid."
-      continue
-    fi
-    docker volume rm -f "$v" >/dev/null 2>&1 || true
-  done
-else
-  info "[DRY-RUN] remove backed-up volumes"
-fi
-COMPLETED_STEPS=$((COMPLETED_STEPS+1))
-pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
-print_progress_bar $pct "Removed volumes"
-printf "\n"
-
-# Phase 3: purge packages, remove dirs, cleanup
-if [ "$DRY_RUN" -eq 0 ]; then
-  if [ "$PURGE" -eq 1 ] && command -v apt-get >/dev/null 2>&1; then
-    apt-get purge -y docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-compose docker-engine docker.io docker-buildx-plugin || true
-    apt-get autoremove -y || true
-    apt-get update -y >/dev/null 2>&1 || true
-  fi
-  rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker*.list || true
-  rm -f /etc/apt/keyrings/docker.gpg /etc/apt/trusted.gpg.d/docker*.gpg 2>/dev/null || true
-  COMMON=(/var/lib/docker /var/lib/containerd /run/docker.sock /run/containerd /etc/docker /etc/containerd /var/run/docker)
-  for d in "${COMMON[@]}"; do
-    if [ -e "$d" ]; then
-      d_abs="$(readlink -f "$d" 2>/dev/null || true)"
-      br_abs="$(readlink -f "$BACKUP_ROOT" 2>/dev/null || true)"
-      if [ -n "$br_abs" ] && [[ "$d_abs" == "$br_abs"* ]]; then
-        info "Melewatkan penghapusan $d (terlindungi oleh BACKUP_ROOT)."
-      else
-        rm -rf "$d" 2>/dev/null || true
-        info "Menghapus $d"
-      fi
-    fi
-  done
-  for b in /usr/bin/docker /usr/local/bin/docker /usr/bin/docker-compose /usr/local/bin/docker-compose /usr/bin/dockerd /usr/bin/containerd; do
-    [ -e "$b" ] && rm -f "$b" || true
-  done
-  if getent group docker >/dev/null 2>&1; then groupdel docker 2>/dev/null || true; fi
-else
-  info "[DRY-RUN] purge packages & cleanup dirs"
-fi
-COMPLETED_STEPS=$((COMPLETED_STEPS+1))
-pct=$(( COMPLETED_STEPS * 100 / TOTAL_STEPS ))
-print_progress_bar $pct "Final cleanup"
-printf "\n"
-
-# Final prune
-if [ "$DRY_RUN" -eq 0 ]; then
-  docker system prune -af --volumes >/dev/null 2>&1 || true
-fi
-
-# -------------------------
-# Final summary
-# -------------------------
 echo
-log "=== RINGKASAN BACKUP & PENGHAPUSAN ==="
-if [ "${#BACKUP_SUCCESSES[@]}" -gt 0 ]; then
-  log "Backup berhasil:"
-  for f in "${BACKUP_SUCCESSES[@]}"; do printf "  - %s\n" "$f"; done
-else
-  warn "Tidak ada backup berhasil tercatat."
-fi
-if [ "${#BACKUP_FAILURES[@]}" -gt 0 ]; then
-  warn "Backup gagal / dilewati (periksa pesan di atas):"
-  for f in "${BACKUP_FAILURES[@]}"; do printf "  - %s\n" "$f"; done
-fi
-log "Folder backup utama: $BACKUP_ROOT"
-if [ -d "$BACKUP_ROOT" ]; then
-  info "Contoh struktur folder backup (beberapa file):"
-  find "$BACKUP_ROOT" -maxdepth 3 -type f -printf '  - %p\n' 2>/dev/null | sed -n '1,40p' || true
-fi
+log "=== RINGKASAN ==="
+if [ "${#BACKUP_SUCCESSES[@]}" -gt 0 ]; then log "Backup sukses:"; for f in "${BACKUP_SUCCESSES[@]}"; do printf "  - %s\n" "$f"; done; else warn "Tidak ada backup."; fi
+if [ "${#BACKUP_FAILURES[@]}" -gt 0 ]; then warn "Backup gagal/skip:"; for f in "${BACKUP_FAILURES[@]}"; do printf "  - %s\n" "$f"; done; fi
+log "Folder backup: $BACKUP_ROOT"
+command -v docker >/dev/null 2>&1 || log "Docker CLI tidak ditemukan; seharusnya sudah bersih."
 
-if [ "$DRY_RUN" -eq 1 ]; then
-  info "DRY-RUN selesai. Tidak ada yang dihapus."
-else
-  if command -v docker >/dev/null 2>&1; then
-    warn "Docker masih ditemukan di PATH: $(command -v docker) — periksa sisa manual."
-  else
-    log "Docker CLI tidak ditemukan di PATH. Sistem seharusnya bersih dari Docker."
-  fi
-fi
-
-log "Selesai. Periksa folder backup dan simpan arsip di lokasi lain jika diperlukan."
 exit 0
