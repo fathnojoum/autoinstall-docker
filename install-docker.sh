@@ -1,5 +1,3 @@
-# contoh menyimpan ke /root/install-docker-fixed.sh
-sudo tee /root/install-docker-fixed.sh > /dev/null <<'EOF'
 #!/usr/bin/env bash
 #
 # Docker Auto-Installer (Ubuntu/Debian) — stable
