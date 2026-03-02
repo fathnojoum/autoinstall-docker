@@ -26,26 +26,31 @@ log_debug() { if [ "${DEBUG:-0}" = "1" ]; then echo -e "${CYAN}🔍 $1${NC}"; fi
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# Show loading spinner with background process
+# Show loading spinner with background process (safe with set -e)
 show_loading() {
-    local pid=$1
-    local msg=$2
+    local pid="${1:?missing pid}"
+    local msg="${2:-Processing...}"
     local idx=0
-    
+    local exit_code=0
+
     while kill -0 "$pid" 2>/dev/null; do
-        printf "\r${CYAN}${SPINNER_CHARS[$idx]} $msg${NC}"
+        printf '\r%b%s %s%b' "$CYAN" "${SPINNER_CHARS[$idx]}" "$msg" "$NC"
         idx=$(( (idx + 1) % ${#SPINNER_CHARS[@]} ))
         sleep "$SPINNER_DELAY"
     done
-    
-    wait "$pid"
-    local exit_code=$?
-    
-    if [ $exit_code -eq 0 ]; then
-        printf "\r${GREEN}✅ $msg${NC}\n"
+
+    # 'wait' may return non-zero; capture safely so set -e won't terminate script early
+    if wait "$pid"; then
+        exit_code=0
     else
-        printf "\r${RED}❌ $msg${NC}\n"
-        return $exit_code
+        exit_code=$?
+    fi
+
+    if [ "$exit_code" -eq 0 ]; then
+        printf '\r%b✅ %s%b\n' "$GREEN" "$msg" "$NC"
+    else
+        printf '\r%b❌ %s%b\n' "$RED" "$msg" "$NC"
+        return "$exit_code"
     fi
 }
 
@@ -65,9 +70,15 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -y|--yes) AUTO_YES=1 ;;
         --no-start) NO_START=1 ;;
-        --channel) CHANNEL="$2"; shift ;;
+        --channel)
+            [ $# -ge 2 ] || log_error "Argumen --channel membutuhkan nilai."
+            CHANNEL="$2"; shift
+            ;;
         --channel=*) CHANNEL="${1#*=}" ;;
-        --version) PIN_VERSION="$2"; shift ;;
+        --version)
+            [ $# -ge 2 ] || log_error "Argumen --version membutuhkan nilai."
+            PIN_VERSION="$2"; shift
+            ;;
         --version=*) PIN_VERSION="${1#*=}" ;;
         --skip-rootless) SKIP_ROOTLESS=1 ;;
         --debug) DEBUG=1 ;;
@@ -80,12 +91,12 @@ Options:
   -y, --yes              Non-interactive (accept prompts)
   --no-start             Do not enable/start services (useful for containers/CI)
   --channel CHANNEL      Docker Apt channel: stable (default), test, nightly
-  --version VERSION      Pin to a specific docker-ce version
+  --version VERSION      Pin docker-ce & docker-ce-cli to a specific version string
   --skip-rootless        Skip installing rootless extras
   --debug                Enable debug output
   -h, --help             Show this help
 
-Note: This script always runs hello-world functional test after install
+Note: This script always attempts hello-world functional test after install
       and removes the image afterwards to keep the system clean.
 USAGE
             exit 0
@@ -98,6 +109,13 @@ USAGE
 done
 
 set -- "${PARAMS[@]:-}"
+
+case "$CHANNEL" in
+    stable|test|nightly) ;;
+    *)
+        log_error "Channel Docker tidak valid: '$CHANNEL'. Gunakan: stable | test | nightly"
+        ;;
+esac
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Re-exec with sudo if necessary
@@ -196,32 +214,22 @@ log_info "Channel Docker: $CHANNEL"
 log_info "Functional test: ALWAYS RUN (hello-world)"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Check if Docker exists
+# User confirmation (if Docker already exists)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if command_exists docker; then
     CURRENT_VERSION="$(docker --version 2>/dev/null || echo 'unknown')"
     log_warn "Docker sudah terinstal: $CURRENT_VERSION"
-    
+
     if [ "${AUTO_YES}" -ne 1 ]; then
+        REPLY=""
         if [ -t 0 ]; then
             echo -n "Lanjutkan untuk update/reinstall? [y/N]: "
-            read -r REPLY
-        else
-            if [ -r /dev/tty ]; then
-                read -r REPLY </dev/tty 2>&1 || true
-            fi
+            read -r REPLY || true
         fi
-        
+
         [[ "$REPLY" =~ ^[Yy]$ ]] || { log_info "Dibatalkan."; exit 0; }
     fi
-    
-    log_step "Cleanup paket Docker lama"
-    (
-        apt-get remove -y docker-ce docker-ce-cli containerd.io >/dev/null 2>&1 || true
-        apt-get autoremove -y >/dev/null 2>&1 || true
-    ) &
-    show_loading $! "Cleanup paket Docker lama"
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -231,15 +239,15 @@ fi
 retry_cmd() {
     local tries=$1; shift
     local sleep_sec=$1; shift
-    
+
     if [ "${1:-}" = "--" ]; then shift; fi
-    
+
     local attempt=1
     while [ $attempt -le "$tries" ]; do
         if "$@"; then
             return 0
         fi
-        
+
         if [ $attempt -lt "$tries" ]; then
             log_debug "Perintah gagal (attempt $attempt/$tries). Retry in ${sleep_sec}s..."
             sleep "$sleep_sec"
@@ -258,15 +266,16 @@ retry_cmd() {
 wait_for_apt() {
     local max_wait=${1:-60}
     local waited=0
-    
+
     while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+          fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
           fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
           fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
-        
+
         if [ "$waited" -ge "$max_wait" ]; then
             log_error "Timeout menunggu lock apt/dpkg (>${max_wait}s)."
         fi
-        
+
         log_debug "Menunggu proses apt/dpkg lain selesai..."
         sleep 2
         waited=$((waited + 2))
@@ -290,7 +299,7 @@ _install_pkgs() {
     local -n pkgs=$1
     local msg=$2
     local to_install=()
-    
+
     for p in "${pkgs[@]}"; do
         if pkg_available "$p"; then
             to_install+=("$p")
@@ -298,18 +307,18 @@ _install_pkgs() {
             log_debug "Paket tidak tersedia: $p (dilewati)."
         fi
     done
-    
+
     if [ "${#to_install[@]}" -eq 0 ]; then
         return 0
     fi
-    
+
     wait_for_apt 120
-    
+
     (
         if retry_cmd 3 2 -- apt-get install -y --no-install-recommends "${to_install[@]}" >/dev/null 2>&1; then
             return 0
         fi
-        
+
         apt-get install -y --no-install-recommends --fix-missing "${to_install[@]}" >/dev/null 2>&1
     ) &
     show_loading $! "$msg"
@@ -340,7 +349,7 @@ else
     log_debug "Paket ekstra tidak ditemukan, dilewati."
 fi
 
-# Install optional deps silently
+# Install optional deps silently (mostly for rootless support)
 for p in dbus-user-session fuse-overlayfs slirp4netns uidmap; do
     if pkg_available "$p"; then
         (
@@ -353,40 +362,67 @@ done
 log_info "Dependensi berhasil diinstal."
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Add Docker GPG key
+# Cleanup existing Docker & conflicting packages (latest docs)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+log_step "Cleanup paket Docker lama & paket konflik"
+
+CONFLICT_PKGS=(docker.io docker-compose docker-doc podman-docker containerd runc)
+if [ "$DOCKER_DISTRO" = "ubuntu" ]; then
+    CONFLICT_PKGS+=(docker-compose-v2)
+fi
+
+(
+    apt-get remove -y \
+        docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras \
+        "${CONFLICT_PKGS[@]}" >/dev/null 2>&1 || true
+
+    apt-get autoremove -y >/dev/null 2>&1 || true
+) &
+show_loading $! "Cleanup paket Docker lama & konflik" || true
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Add Docker GPG key (latest docs format: docker.asc)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log_step "Tambahkan GPG key resmi Docker"
 
 install -d -m 0755 /etc/apt/keyrings
 
-KEYRING_PATH="/etc/apt/keyrings/docker.gpg"
+KEYRING_PATH="/etc/apt/keyrings/docker.asc"
 
-if [ -f "$KEYRING_PATH" ]; then
-    rm -f "$KEYRING_PATH"
-    log_debug "GPG key lama dihapus."
-fi
+# Cleanup legacy key/repo files to avoid duplicate sources warnings
+rm -f /etc/apt/keyrings/docker.gpg /etc/apt/sources.list.d/docker.list || true
 
 (
-    curl -fsSL "$DOCKER_KEY_URL" | gpg --batch --yes --dearmor -o "$KEYRING_PATH" 2>/dev/null
+    curl -fsSL "$DOCKER_KEY_URL" -o "$KEYRING_PATH" >/dev/null 2>&1
 ) &
-show_loading $! "Download & import GPG key Docker" || log_error "Gagal unduh/convert GPG key dari $DOCKER_KEY_URL"
+show_loading $! "Download GPG key Docker" || log_error "Gagal unduh GPG key dari $DOCKER_KEY_URL"
 
 chmod a+r "$KEYRING_PATH"
-log_info "GPG key Docker berhasil ditambahkan."
+log_info "GPG key Docker berhasil ditambahkan: $KEYRING_PATH"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Add Docker APT repository
+# Add Docker APT repository (Deb822 docker.sources)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log_step "Tambahkan repository Docker ($CHANNEL)"
 
 ARCH="$(dpkg --print-architecture)"
-REPO_LINE="deb [arch=${ARCH} signed-by=${KEYRING_PATH}] https://download.docker.com/linux/${DOCKER_DISTRO} ${CODENAME} ${CHANNEL}"
+DOCKER_SOURCES_FILE="/etc/apt/sources.list.d/docker.sources"
 
-echo "$REPO_LINE" | tee /etc/apt/sources.list.d/docker.list >/dev/null || log_error "Gagal menambahkan repository."
+cat > "$DOCKER_SOURCES_FILE" <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/${DOCKER_DISTRO}
+Suites: ${CODENAME}
+Components: ${CHANNEL}
+Architectures: ${ARCH}
+Signed-By: ${KEYRING_PATH}
+EOF
 
-log_info "Repository Docker ditambahkan: ${CODENAME} (${CHANNEL})"
+log_info "Repository Docker ditambahkan (Deb822): ${DOCKER_SOURCES_FILE}"
+log_info "Repo target: ${DOCKER_DISTRO} ${CODENAME} (${CHANNEL})"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Update dan install Docker Engine
@@ -399,34 +435,42 @@ log_step "Update repository dan instal Docker Engine"
 ) &
 show_loading $! "Update repository Docker" || log_error "Gagal update setelah menambahkan repo Docker."
 
-CORE_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
-
-if [ "$SKIP_ROOTLESS" -eq 0 ]; then
-    CORE_PKGS+=(docker-ce-rootless-extras)
-fi
+BASE_PKGS=(containerd.io docker-buildx-plugin docker-compose-plugin)
+ENGINE_PKGS=(docker-ce docker-ce-cli)
 
 if [ -n "$PIN_VERSION" ]; then
-    INSTALL_LIST=()
-    for pkg in "${CORE_PKGS[@]}"; do
-        INSTALL_LIST+=("${pkg}=${PIN_VERSION}")
-    done
+    # Validate requested version exists for docker-ce
+    if ! apt-cache madison docker-ce | awk '{print $3}' | grep -Fxq "$PIN_VERSION"; then
+        log_error "Versi docker-ce tidak ditemukan di repo: $PIN_VERSION (cek 'apt-cache madison docker-ce')."
+    fi
+
+    INSTALL_LIST=("${BASE_PKGS[@]}" "docker-ce=${PIN_VERSION}" "docker-ce-cli=${PIN_VERSION}")
+
+    # rootless extras biasanya sejalan versinya dengan docker-ce, tapi tidak selalu tersedia
+    if [ "$SKIP_ROOTLESS" -eq 0 ] && pkg_available "docker-ce-rootless-extras"; then
+        if apt-cache madison docker-ce-rootless-extras | awk '{print $3}' | grep -Fxq "$PIN_VERSION"; then
+            INSTALL_LIST+=("docker-ce-rootless-extras=${PIN_VERSION}")
+        else
+            log_warn "Versi rootless extras = $PIN_VERSION tidak tersedia; install versi terbaru untuk rootless extras."
+            INSTALL_LIST+=("docker-ce-rootless-extras")
+        fi
+    fi
+
     (
         apt-get install -y --allow-downgrades --no-install-recommends "${INSTALL_LIST[@]}" >/dev/null 2>&1
     ) &
     show_loading $! "Instalasi Docker Engine (pinned version)" || log_error "Gagal install paket Docker (pinned version)."
 else
-    REQ_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
-    (
-        apt-get install -y --no-install-recommends "${REQ_PKGS[@]}" >/dev/null 2>&1
-    ) &
-    show_loading $! "Instalasi Docker Engine & plugins" || log_error "Gagal install paket Docker inti."
-    
+    INSTALL_LIST=("${BASE_PKGS[@]}" "${ENGINE_PKGS[@]}")
+
     if [ "$SKIP_ROOTLESS" -eq 0 ] && pkg_available "docker-ce-rootless-extras"; then
-        (
-            apt-get install -y --no-install-recommends docker-ce-rootless-extras >/dev/null 2>&1
-        ) &
-        show_loading $! "Instalasi rootless extras" || log_warn "Gagal install rootless extras (non-fatal)."
+        INSTALL_LIST+=("docker-ce-rootless-extras")
     fi
+
+    (
+        apt-get install -y --no-install-recommends "${INSTALL_LIST[@]}" >/dev/null 2>&1
+    ) &
+    show_loading $! "Instalasi Docker Engine & plugins" || log_error "Gagal install paket Docker."
 fi
 
 log_info "Docker Engine dan plugin berhasil diinstal."
@@ -442,6 +486,7 @@ if [ "$REAL_USER" != "root" ] && id -u "$REAL_USER" >/dev/null 2>&1; then
         log_warn "User $REAL_USER sudah ada di grup docker."
     else
         usermod -aG docker "$REAL_USER" || log_warn "Gagal menambahkan user ke grup docker."
+        log_warn "Grup 'docker' memberi akses setara root. Pastikan hanya user tepercaya yang ditambahkan."
         log_info "User $REAL_USER ditambahkan ke grup docker (perlu relogin)."
     fi
 else
@@ -473,8 +518,8 @@ if [ -f /proc/sys/kernel/osrelease ] && grep -qiE 'microsoft|wsl' /proc/sys/kern
 fi
 
 if [ "${SYSTEMD_AVAILABLE}" -eq 1 ] && [ "${WSL_ENV}" -eq 0 ] && [ "${NO_START:-0}" -eq 0 ]; then
-    systemctl enable docker.service containerd.service 2>/dev/null || log_warn "Gagal enable service (non-fatal)."
-    systemctl start docker.service 2>/dev/null || log_warn "Gagal start service (non-fatal)."
+    systemctl enable docker.service containerd.service >/dev/null 2>&1 || log_warn "Gagal enable service (non-fatal)."
+    systemctl start docker.service >/dev/null 2>&1 || log_warn "Gagal start service (non-fatal)."
     log_info "Docker service diaktifkan."
 else
     if [ "${WSL_ENV}" -eq 1 ]; then
@@ -511,13 +556,13 @@ if [ "${DOCKER_READY}" -eq 1 ]; then
     (
         docker run --rm hello-world >/dev/null 2>&1
     ) &
-    show_loading $! "Test container hello-world" || log_warn "Tes hello-world gagal (mungkin issue registri/network)."
-    
-    # Clean up hello-world image
+    show_loading $! "Test container hello-world" || log_warn "Tes hello-world gagal (mungkin issue registry/network/daemon)."
+
+    # Clean up hello-world image if it exists (docker run --rm removes container, not image)
     sleep 1
-    IMAGE_ID="$(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep '^hello-world:latest ' | awk '{print $2; exit}' 2>/dev/null || true)"
+    IMAGE_ID="$(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | awk '$1=="hello-world:latest"{print $2; exit}' 2>/dev/null || true)"
     if [ -n "$IMAGE_ID" ]; then
-        docker image rm -f "$IMAGE_ID" 2>/dev/null || true
+        docker image rm -f "$IMAGE_ID" >/dev/null 2>&1 || true
         log_debug "Image hello-world dihapus (cleanup)."
     fi
 else
@@ -538,7 +583,7 @@ show_loading $! "Cleanup paket tidak diperlukan" || true
 
 if [ "${SYSTEMD_AVAILABLE}" -eq 1 ]; then
     echo "📊 Docker service status:"
-    if systemctl is-active --quiet docker.service 2>/dev/null; then
+    if systemctl is-active --quiet docker.service >/dev/null 2>&1; then
         log_info "Docker daemon running"
     else
         log_warn "Docker daemon belum running"
@@ -547,7 +592,7 @@ if [ "${SYSTEMD_AVAILABLE}" -eq 1 ]; then
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Final Verification - dengan warna KUNING untuk version info
+# Final Verification - version info in yellow
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 echo ""
@@ -560,13 +605,13 @@ if command_exists docker; then
     echo ""
 fi
 
-if docker compose version >/dev/null 2>&1; then
+if command_exists docker && docker compose version >/dev/null 2>&1; then
     echo "🧩 Docker Compose (plugin):"
     docker compose version | sed "s/^/${YELLOW}/; s/$/${NC}/"
     echo ""
 fi
 
-if docker buildx version >/dev/null 2>&1; then
+if command_exists docker && docker buildx version >/dev/null 2>&1; then
     echo "🔨 Docker Buildx:"
     docker buildx version | head -1 | sed "s/^/${YELLOW}/; s/$/${NC}/"
     echo ""
