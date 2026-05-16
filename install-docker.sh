@@ -108,7 +108,7 @@ USAGE
     shift
 done
 
-set -- "${PARAMS[@]:-}"
+if [ "${#PARAMS[@]}" -gt 0 ]; then set -- "${PARAMS[@]}"; else set --; fi
 
 case "$CHANNEL" in
     stable|test|nightly) ;;
@@ -371,6 +371,8 @@ CONFLICT_PKGS=(docker.io docker-compose docker-doc podman-docker containerd runc
 if [ "$DOCKER_DISTRO" = "ubuntu" ]; then
     CONFLICT_PKGS+=(docker-compose-v2)
 fi
+
+wait_for_apt 120
 
 (
     apt-get remove -y \
