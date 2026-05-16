@@ -597,30 +597,119 @@ fi
 # Final Verification - version info in yellow
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-echo ""
-log_step "Verifikasi instalasi final"
-echo ""
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Collect version info
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DOCKER_VER=""
+COMPOSE_VER=""
+BUILDX_VER=""
 
 if command_exists docker; then
-    echo "🐳 Docker version:"
-    docker --version | sed "s/^/${YELLOW}/; s/$/${NC}/"
-    echo ""
+    DOCKER_VER="$(docker --version 2>/dev/null | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1 || true)"
 fi
 
 if command_exists docker && docker compose version >/dev/null 2>&1; then
-    echo "🧩 Docker Compose (plugin):"
-    docker compose version | sed "s/^/${YELLOW}/; s/$/${NC}/"
-    echo ""
+    COMPOSE_VER="$(docker compose version 2>/dev/null | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1 || true)"
 fi
 
 if command_exists docker && docker buildx version >/dev/null 2>&1; then
-    echo "🔨 Docker Buildx:"
-    docker buildx version | head -1 | sed "s/^/${YELLOW}/; s/$/${NC}/"
-    echo ""
+    BUILDX_VER="$(docker buildx version 2>/dev/null | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1 || true)"
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-log_info "💡 Proses instalasi Docker SUKSES!"
+# Animasi reveal summary
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+sleep 0.3
+
+# Typewriter line
+_typewrite() {
+    local text="$1"
+    local delay="${2:-0.03}"
+    local i=0
+    while [ $i -lt ${#text} ]; do
+        printf '%s' "${text:$i:1}"
+        sleep "$delay"
+        i=$((i + 1))
+    done
+    printf '\n'
+}
+
+# Animated bar fill
+_bar_fill() {
+    local label="$1"
+    local value="$2"
+    local color="$3"
+    local width=30
+    local i=0
+    printf "${color}  %-18s${NC}" "$label"
+    while [ $i -lt $width ]; do
+        printf "${color}─${NC}"
+        i=$((i + 1))
+        sleep 0.01
+    done
+    printf " ${YELLOW}%s${NC}\n" "$value"
+}
+
+echo ""
+printf '%b' "$CYAN"
+_typewrite "╔══════════════════════════════════════════════════════╗" 0.005
+_typewrite "║           🐳  DOCKER INSTALLATION SUMMARY           ║" 0.005
+_typewrite "╚══════════════════════════════════════════════════════╝" 0.005
+printf '%b' "$NC"
+echo ""
+
+_bar_fill "Docker Engine"   "${DOCKER_VER:-n/a}"  "$GREEN"
+sleep 0.1
+_bar_fill "Docker Compose"  "${COMPOSE_VER:-n/a}" "$GREEN"
+sleep 0.1
+_bar_fill "Docker Buildx"   "${BUILDX_VER:-n/a}"  "$GREEN"
+sleep 0.1
+
+echo ""
+printf '%b' "$CYAN"
+_typewrite "──────────────────────────────────────────────────────" 0.003
+printf '%b' "$NC"
+
+# Status daemon
+printf "  %-18s" "Daemon status"
+sleep 0.2
+if systemctl is-active --quiet docker.service 2>/dev/null; then
+    printf '%b' "$GREEN"
+    _typewrite "● running" 0.04
+    printf '%b' "$NC"
+else
+    printf '%b' "$YELLOW"
+    _typewrite "○ not running" 0.04
+    printf '%b' "$NC"
+fi
+
+# User group
+printf "  %-18s" "Docker group"
+sleep 0.1
+if [ "$REAL_USER" != "root" ] && id -nG "$REAL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    printf '%b' "$GREEN"
+    _typewrite "✔ $REAL_USER added" 0.04
+    printf '%b' "$NC"
+else
+    printf '%b' "$YELLOW"
+    _typewrite "root (no group needed)" 0.04
+    printf '%b' "$NC"
+fi
+
+echo ""
+printf '%b' "$CYAN"
+_typewrite "──────────────────────────────────────────────────────" 0.003
+printf '%b' "$NC"
+echo ""
+
+# Final success line
+sleep 0.2
+printf '%b' "$GREEN"
+_typewrite "  ✅  Instalasi Docker selesai & siap digunakan!" 0.03
+printf '%b' "$NC"
+echo ""
 
 exit 0
