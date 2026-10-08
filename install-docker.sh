@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 #
 # Docker Engine installer — Ubuntu & Debian
-#
-# Mengikuti:
-#   https://docs.docker.com/engine/install/debian/
-#   https://docs.docker.com/engine/install/ubuntu/
-#   https://docs.docker.com/engine/install/linux-postinstall/
-# Panduan diverifikasi ulang: 9 Oktober 2026
+# Versi: 3.0 FINAL | Docs checked: 2026-10-09
 # Author: Fath Nojoum
 #
-# shellcheck disable=SC2317   # log_* dipanggil dari subshell/fungsi lain -> diduga "unreachable"
+# shellcheck disable=SC2317
+#
+# Perubahan v3.0:
+#   - FIX: wait_for_apt tidak lagi hard-fail saat bootstrap (chicken-and-egg
+#     dengan psmisc/fuser). Sekarang pakai /proc scan sebagai fallback.
+#   - wait_for_apt berlapis: fuser → /proc scan → no-op.
+#   - Timeout menampilkan nama proses pemegang lock.
+#
 
 set -euo pipefail
 
@@ -17,15 +19,11 @@ set -euo pipefail
 # Konstanta
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-INSTALLER_VERSION="2.1"
+INSTALLER_VERSION="3.0"
 DOCS_CHECKED="2026-10-09"
 
-# Fingerprint resmi GPG key Docker (SHA1)
 DOCKER_GPG_FINGERPRINT="9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88"
 
-# Arsitektur yang didukung resmi (docs, 9 Okt 2026)
-#   Debian : amd64, armhf, arm64, ppc64el
-#   Ubuntu : amd64, armhf, arm64, s390x, ppc64el
 SUPPORTED_ARCH_DEBIAN="amd64 armhf arm64 ppc64el"
 SUPPORTED_ARCH_UBUNTU="amd64 armhf arm64 s390x ppc64el"
 
@@ -61,6 +59,7 @@ CHANNEL="stable"
 PIN_VERSION=""
 SKIP_ROOTLESS=0
 DEBUG=0
+TARGET_USER=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -73,6 +72,9 @@ while [ $# -gt 0 ]; do
                          PIN_VERSION="$2"; shift ;;
         --version=*)     PIN_VERSION="${1#*=}" ;;
         --skip-rootless) SKIP_ROOTLESS=1 ;;
+        --user)          [ $# -ge 2 ] || log_error "--user butuh nilai."
+                         TARGET_USER="$2"; shift ;;
+        --user=*)        TARGET_USER="${1#*=}" ;;
         --debug)         DEBUG=1 ;;
         --)              shift; break ;;
         -h|--help)
@@ -80,18 +82,17 @@ while [ $# -gt 0 ]; do
 Usage: install-docker.sh [options]
 
 Options:
-  -y, --yes              Non-interaktif (asumsikan "ya" untuk prompt yang aman)
+  -y, --yes              Non-interaktif
   --no-start             Jangan enable/start service (container/CI)
-  --channel CHANNEL      Channel repo Docker: stable (default) | test | nightly
-  --version VERSION      Pin docker-ce & docker-ce-cli. Terima:
-                           29.8.2                              (versi saja)
-                           5:29.8.2                            (epoch:versi)
-                           5:29.8.2-1~debian.12~bookworm       (string lengkap)
+  --channel CHANNEL      stable (default) | test | nightly
+  --version VERSION      Pin docker-ce & docker-ce-cli
   --skip-rootless        Jangan install docker-ce-rootless-extras
-  --debug                Tampilkan output apt/curl secara live
+  --user USER            User non-root untuk setup grup docker & rootless
+  --debug                Tampilkan output apt/curl live
   -h, --help             Bantuan ini
 
 Catatan:
+  - v3.0: wait_for_apt tidak butuh 'fuser' saat bootstrap (fix Debian minimal).
   - Selalu menjalankan tes fungsional hello-world lalu menghapus image-nya.
   - Grup 'docker' = hak setara root; TIDAK ditambahkan otomatis pada mode -y.
   - /etc/docker/daemon.json hanya ditulis bila belum ada.
@@ -127,28 +128,43 @@ fi
 # User & home
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+# Prioritas: --user > SUDO_USER > root
+if [ -n "$TARGET_USER" ]; then
+    REAL_USER="$TARGET_USER"
+elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
     REAL_USER="$SUDO_USER"
-    REAL_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-    [ -n "$REAL_HOME" ] || REAL_HOME="/home/$SUDO_USER"
 else
     REAL_USER="root"
+fi
+
+if [ "$REAL_USER" = "root" ]; then
     REAL_HOME="/root"
+else
+    REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6 || true)"
+    [ -n "$REAL_HOME" ] || REAL_HOME="/home/$REAL_USER"
+    # Validasi user benar-benar ada
+    if ! getent passwd "$REAL_USER" >/dev/null 2>&1; then
+        log_error "User '$REAL_USER' tidak ditemukan."
+    fi
 fi
 
 umask 022
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Deteksi OS
+# Banner
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 cat <<'BANNER'
 
 ╔═══════════════════════════════════════════════════════╗
-║  🐳  Docker Auto-Installer                            ║
+║  🐳  Docker Auto-Installer  v3.0 FINAL                ║
 ║  By: Fath Nojoum                                      ║
 ╚═══════════════════════════════════════════════════════╝
 BANNER
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Deteksi OS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log_step "Deteksi OS"
 
@@ -175,19 +191,18 @@ case "${ID,,}" in
         ;;
 esac
 
-# Docs menulis: Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
 CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
 if [ -z "$CODENAME" ] && command_exists lsb_release; then
     CODENAME="$(lsb_release -cs)"
 fi
-[ -n "$CODENAME" ] || log_error "Tidak bisa menentukan codename. Pastikan VERSION_CODENAME ada di /etc/os-release."
+[ -n "$CODENAME" ] || log_error "Tidak bisa menentukan codename."
 
 ARCH="$(dpkg --print-architecture)"
 
 log_info "OS: $OS_INFO | codename: $CODENAME | arch: $ARCH"
 log_info "Channel: $CHANNEL${PIN_VERSION:+ | pin: $PIN_VERSION}"
+log_info "Target user: $REAL_USER"
 
-# Validasi arsitektur.
 case " $SUPPORTED_ARCHES " in
     *" $ARCH "*) ;;
     *)
@@ -197,7 +212,7 @@ case " $SUPPORTED_ARCHES " in
         ;;
 esac
 
-# Validasi codename: probe Release file repo Docker.
+# Validasi codename via probe ke Release file
 CODENAME_RELEASE_URL="https://download.docker.com/linux/${DOCKER_DISTRO}/dists/${CODENAME}/Release"
 
 if curl -fsI "$CODENAME_RELEASE_URL" >/dev/null 2>&1; then
@@ -205,7 +220,6 @@ if curl -fsI "$CODENAME_RELEASE_URL" >/dev/null 2>&1; then
 else
     log_error "Repo Docker tidak punya suite '${CODENAME}' untuk $DOCKER_DISTRO."
     log_note "Dicek: $CODENAME_RELEASE_URL"
-    log_note "Docs (Debian): untuk Debian testing, ganti codename dengan rilis yang sesuai."
     log_note "Suite yang tersedia:"
     curl -fsSL "https://download.docker.com/linux/${DOCKER_DISTRO}/dists/" 2>/dev/null \
         | grep -oE 'href="[^"]+/"' | sed 's/href="//;s/\/"//' \
@@ -306,31 +320,88 @@ retry_cmd() {
     done
 }
 
-# Tunggu lock apt/dpkg.
-# REVISI v2.1: Jika 'fuser' tidak tersedia, ini adalah hard failure karena
-# melewati penungguan lock bisa menyebabkan kegagalan apt yang tidak jelas.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX v3.0: wait_for_apt tanpa ketergantungan 'fuser'
+#
+# Masalah v2.1: 'fuser' disediakan paket 'psmisc' yang BARU diinstal di step
+# berikutnya. Saat Debian minimal, fuser belum ada → hard-fail sebelum
+# sempat instal psmisc. Chicken-and-egg.
+#
+# Solusi v3.0: tiga lapis deteksi lock
+#   1. fuser (jika tersedia)   — presisi, cek lock file spesifik
+#   2. /proc scan              — selalu ada di Linux, cek nama proses apt/dpkg
+#   3. no-op                   — kalau dua-duanya gagal (sangat jarang)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Deteksi proses apt/dpkg via /proc — tidak butuh tools eksternal
+_apt_process_running() {
+    local proc comm
+    for proc in /proc/[0-9]*/comm; do
+        [ -r "$proc" ] || continue
+        comm="$(cat "$proc" 2>/dev/null || true)"
+        case "$comm" in
+            apt|apt-get|dpkg|dpkg-deb|unattended-upgrade|apt-helper|aptd)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+# Tampilkan nama proses apt yang sedang berjalan (untuk diagnostik timeout)
+_apt_process_info() {
+    local proc pid comm
+    for proc in /proc/[0-9]*/comm; do
+        [ -r "$proc" ] || continue
+        comm="$(cat "$proc" 2>/dev/null || true)"
+        case "$comm" in
+            apt|apt-get|dpkg|dpkg-deb|unattended-upgrade|apt-helper|aptd)
+                pid="$(basename "$(dirname "$proc")")"
+                printf '   PID %s: %s\n' "$pid" "$comm"
+                ;;
+        esac
+    done
+}
+
 wait_for_apt() {
     local max_wait="${1:-120}"
     local waited=0
 
-    if ! command_exists fuser; then
-        log_error "FATAL: 'fuser' (dari paket psmisc) tidak tersedia."
-        log_note "Tidak bisa menunggu lock apt dengan aman. Instal 'psmisc' secara manual lalu jalankan ulang."
-        exit 1
+    # ── Tier 1: fuser (paling presisi, cek lock file spesifik) ──
+    if command_exists fuser; then
+        log_debug "Menggunakan 'fuser' untuk deteksi lock apt."
+        while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+              fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+              fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+              fuser /var/cache/apt/archives/lock >/dev/null 2>&1
+        do
+            if [ "$waited" -ge "$max_wait" ]; then
+                log_error "Timeout menunggu lock apt/dpkg (>${max_wait}s)."
+                log_note "Proses yang memegang lock:"
+                _apt_process_info >&2 || true
+                exit 1
+            fi
+            log_debug "Menunggu lock apt/dpkg (fuser)... ${waited}s"
+            sleep 2
+            waited=$(( waited + 2 ))
+        done
+        return 0
     fi
 
-    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
-          fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-          fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
-          fuser /var/cache/apt/archives/lock >/dev/null 2>&1
-    do
+    # ── Tier 2: /proc scan (fallback, selalu ada) ──
+    log_debug "fuser tidak tersedia, fallback ke /proc scan."
+    while _apt_process_running; do
         if [ "$waited" -ge "$max_wait" ]; then
-            log_error "Timeout menunggu lock apt/dpkg (>${max_wait}s). Proses apt lain masih jalan?"
+            log_error "Timeout menunggu proses apt/dpkg selesai (>${max_wait}s)."
+            log_note "Proses yang masih berjalan:"
+            _apt_process_info >&2 || true
+            exit 1
         fi
-        log_debug "Menunggu lock apt/dpkg..."
+        log_debug "Menunggu proses apt/dpkg selesai... ${waited}s"
         sleep 2
         waited=$(( waited + 2 ))
     done
+    return 0
 }
 
 install_pkgs_if_available() {
@@ -355,10 +426,10 @@ install_pkgs_if_available() {
     run_step "$msg" apt-get install -y --no-install-recommends "${to_install[@]}"
 }
 
-# Normalisasi versi Debian.
+# Normalisasi versi Debian
 normalize_version() {
     local v="${1#*:}"             # buang epoch "5:"
-    v="${v%%+ds*}"                # buang "+dsN" (repack Debian)
+    v="${v%%+ds*}"                # buang "+dsN"
     printf '%s' "${v%%-[0-9]*~*}" # buang "-N~distro"
 }
 
@@ -374,17 +445,22 @@ run_step "apt-get update" retry_cmd 4 2 -- apt-get update -o Acquire::Retries=3
 log_step "Instal dependensi"
 
 install_pkgs_if_available "Dependensi inti" \
-    ca-certificates curl lsb-release psmisc gnupg
+    ca-certificates curl lsb-release gnupg psmisc
 
 if [ "$SKIP_ROOTLESS" -eq 0 ]; then
     install_pkgs_if_available "Dependensi rootless" \
         dbus-user-session fuse-overlayfs slirp4netns uidmap
 fi
 
-command_exists fuser || log_warn "'fuser' (psmisc) tidak ada — deteksi lock apt dilewati."
+# Setelah psmisc terinstal, cek apakah fuser sekarang tersedia
+if command_exists fuser; then
+    log_debug "'fuser' tersedia — deteksi lock presisi aktif."
+else
+    log_warn "'fuser' tidak tersedia — deteksi lock pakai /proc scan (tetap aman)."
+fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Hentikan service sebelum mencabut paket
+# Deteksi systemd & WSL
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 HAVE_SYSTEMD=0
@@ -396,6 +472,10 @@ WSL_ENV=0
 if [ -f /proc/sys/kernel/osrelease ] && grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
     WSL_ENV=1
 fi
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Hentikan service sebelum mencabut paket
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log_step "Hentikan service Docker"
 
@@ -442,7 +522,7 @@ else
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Repo Docker: GPG key + Deb822 docker.sources
+# GPG key + verifikasi fingerprint
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log_step "Tambahkan GPG key resmi Docker"
@@ -455,7 +535,6 @@ rm -f /etc/apt/keyrings/docker.gpg /etc/apt/sources.list.d/docker.list
 run_step "Download GPG key Docker" curl -fsSL "$DOCKER_KEY_URL" -o "$KEYRING_PATH"
 chmod a+r "$KEYRING_PATH"
 
-# REVISI v2.1: Verifikasi fingerprint GPG key untuk mencegah serangan MITM.
 log_info "Memverifikasi fingerprint GPG key..."
 ACTUAL_FP="$(gpg --show-keys --with-fingerprint --with-colons "$KEYRING_PATH" 2>/dev/null \
     | awk -F: '/^fpr:/ {print $10; exit}' || true)"
@@ -469,12 +548,15 @@ if [ "$ACTUAL_FP" != "${DOCKER_GPG_FINGERPRINT// /}" ]; then
     log_error "Fingerprint GPG key TIDAK COCOK!"
     log_note "Diharapkan: $DOCKER_GPG_FINGERPRINT"
     log_note "Ditemukan : $ACTUAL_FP"
-    log_note "Kemungkinan serangan MITM atau file key telah dimodifikasi. Instalasi dibatalkan."
+    log_note "Kemungkinan serangan MITM. Instalasi dibatalkan."
     exit 1
 fi
 
-log_info "Fingerprint GPG key terverifikasi: $DOCKER_GPG_FINGERPRINT"
-log_info "GPG key: $KEYRING_PATH"
+log_info "Fingerprint terverifikasi: $DOCKER_GPG_FINGERPRINT"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Repo Docker (Deb822)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log_step "Tambahkan repository Docker ($CHANNEL)"
 
@@ -490,7 +572,6 @@ Signed-By: ${KEYRING_PATH}
 EOF
 
 log_info "Ditulis: $DOCKER_SOURCES_FILE"
-log_note "URIs: https://download.docker.com/linux/${DOCKER_DISTRO}"
 log_note "Suites: ${CODENAME} | Components: ${CHANNEL} | Architectures: ${ARCH}"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -506,7 +587,7 @@ ENGINE_PKGS=(docker-ce docker-ce-cli)
 
 if [ -n "$PIN_VERSION" ]; then
     AVAILABLE_RAW="$(apt-cache madison docker-ce | awk '{print $3}' || true)"
-    [ -n "$AVAILABLE_RAW" ] || log_error "Repo Docker tidak punya docker-ce. Cek konektivitas: curl -I $DOCKER_KEY_URL"
+    [ -n "$AVAILABLE_RAW" ] || log_error "Repo Docker tidak punya docker-ce."
 
     WANT_NORM="$(normalize_version "$PIN_VERSION")"
     RESOLVED=""
@@ -514,8 +595,7 @@ if [ -n "$PIN_VERSION" ]; then
     while IFS= read -r v; do
         [ -n "$v" ] || continue
         if [ "$v" = "$PIN_VERSION" ]; then
-            RESOLVED="$v"
-            break
+            RESOLVED="$v"; break
         fi
     done <<< "$AVAILABLE_RAW"
 
@@ -523,15 +603,13 @@ if [ -n "$PIN_VERSION" ]; then
         while IFS= read -r v; do
             [ -n "$v" ] || continue
             if [ "$(normalize_version "$v")" = "$WANT_NORM" ]; then
-                RESOLVED="$v"
-                break
+                RESOLVED="$v"; break
             fi
         done <<< "$AVAILABLE_RAW"
     fi
 
     if [ -z "$RESOLVED" ]; then
         log_error "Versi '$PIN_VERSION' tidak ada di repo ${DOCKER_DISTRO}/${CODENAME} (${CHANNEL})."
-        log_note "Dicoba cari: $WANT_NORM"
         log_note "Tersedia (10 terbaru):"
         printf '%s\n' "$AVAILABLE_RAW" | head -n 10 | sed 's/^/   /'
         exit 1
@@ -566,7 +644,6 @@ fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # subuid/subgid untuk rootless
-# REVISI v2.1: Verifikasi rentang minimal 65.536 sesuai dokumentasi resmi.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if [ "$SKIP_ROOTLESS" -eq 0 ] && [ "$REAL_USER" != "root" ]; then
@@ -576,16 +653,13 @@ if [ "$SKIP_ROOTLESS" -eq 0 ] && [ "$REAL_USER" != "root" ]; then
     SUBGID_LINE="$(grep "^${REAL_USER}:" /etc/subgid 2>/dev/null || true)"
 
     if [ -n "$SUBUID_LINE" ] && [ -n "$SUBGID_LINE" ]; then
-        # Ekstrak rentang: "user:100000:65536" -> 65536
         SUBUID_RANGE="$(echo "$SUBUID_LINE" | cut -d: -f3)"
         SUBGID_RANGE="$(echo "$SUBGID_LINE" | cut -d: -f3)"
-
         if [ "${SUBUID_RANGE:-0}" -ge 65536 ] && [ "${SUBGID_RANGE:-0}" -ge 65536 ]; then
-            log_info "subuid/subgid untuk $REAL_USER sudah ada dengan rentang memadai (${SUBUID_RANGE}/${SUBGID_RANGE})."
+            log_info "subuid/subgid OK (${SUBUID_RANGE}/${SUBGID_RANGE})."
         else
-            log_warn "Rentang subuid/subgid untuk $REAL_USER kurang dari 65.536."
-            log_note "Rootless mode membutuhkan minimal 65.536 subordinate UID/GID."
-            log_note "Perbaiki manual: usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $REAL_USER"
+            log_warn "Rentang subuid/subgid < 65.536 — rootless mungkin gagal."
+            log_note "Perbaiki: usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $REAL_USER"
         fi
     elif usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$REAL_USER"; then
         log_info "subuid/subgid 100000-165535 untuk $REAL_USER."
@@ -596,7 +670,6 @@ fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Logging driver
-# REVISI v2.1: Beri peringatan jika daemon.json ada tapi tidak punya log-driver.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 DAEMON_JSON="/etc/docker/daemon.json"
@@ -606,15 +679,14 @@ log_step "Konfigurasi logging driver"
 if [ -f "$DAEMON_JSON" ]; then
     log_warn "$DAEMON_JSON sudah ada — tidak ditimpa."
     if grep -q '"log-driver"' "$DAEMON_JSON" 2>/dev/null; then
-        log_info "Konfigurasi log-driver terdeteksi di daemon.json."
+        log_info "log-driver terdeteksi di daemon.json."
     else
-        log_warn "daemon.json TIDAK memiliki konfigurasi log-driver."
-        log_note "Rekomendasi: tambahkan rotasi log untuk mencegah disk penuh, misalnya:"
-        log_note '{ "log-driver": "local", "log-opts": { "max-size": "10m", "max-file": "3" } }'
+        log_warn "daemon.json TIDAK punya log-driver."
+        log_note 'Rekomendasi: { "log-driver": "local", "log-opts": { "max-size": "10m", "max-file": "3" } }'
     fi
 elif [ "$NO_START" -eq 1 ]; then
-    log_warn "Mode --no-start: daemon.json tidak ditulis. Tambahkan manual sebelum start:"
-    log_note '{ "log-driver": "local", "log-opts": { "max-size": "10m", "max-file": "3" } }'
+    log_warn "Mode --no-start: daemon.json tidak ditulis."
+    log_note 'Manual: { "log-driver": "local", "log-opts": { "max-size": "10m", "max-file": "3" } }'
 else
     install -d -m 0755 /etc/docker
     cat > "$DAEMON_JSON" <<'EOF'
@@ -628,7 +700,6 @@ else
 EOF
     chmod 0644 "$DAEMON_JSON"
     log_info "Ditulis $DAEMON_JSON — log-driver: local (rotasi 10m x 3)"
-    log_note "Driver 'local' rotasi otomatis; json-file tidak."
 fi
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -652,7 +723,7 @@ else
     else
         ADD_USER=0
         if [ "$AUTO_YES" -eq 1 ]; then
-            log_warn "Grup 'docker' memberi akses setara root — TIDAK ditambahkan otomatis pada mode -y."
+            log_warn "Grup 'docker' = setara root — TIDAK ditambahkan otomatis pada mode -y."
             log_note "Bila perlu: sudo usermod -aG docker $REAL_USER  (lalu logout/login)"
         elif [ -t 0 ]; then
             printf 'Tambahkan %s ke grup docker (setara root)? [y/N]: ' "$REAL_USER"
@@ -679,7 +750,7 @@ else
 
     if [ ! -d "$REAL_HOME/.docker" ]; then
         mkdir -p "$REAL_HOME/.docker"
-        chown -R "$REAL_USER:$REAL_USER" "$REAL_HOME/.docker"
+        chown -R "$REAL_USER:$REAL_USER" "$REAL_HOME/.docker" 2>/dev/null || true
         log_info "Dibuat: $REAL_HOME/.docker"
     fi
 fi
@@ -691,9 +762,9 @@ fi
 log_step "Enable dan start service Docker"
 
 if [ "$NO_START" -eq 1 ]; then
-    log_warn "Mode --no-start: service tidak di-enable/di-start (sesuai permintaan)."
+    log_warn "Mode --no-start: service tidak di-enable/start."
 elif [ "$WSL_ENV" -eq 1 ]; then
-    log_warn "WSL terdeteksi — lewati enable/start (di-handle WSL)."
+    log_warn "WSL terdeteksi — lewati enable/start."
 elif [ "$HAVE_SYSTEMD" -eq 1 ]; then
     run_step "systemctl enable + restart docker" bash -c '
         set -e
@@ -777,6 +848,7 @@ printf '  %-16s %s\n' "Docker Compose"  "${COMPOSE_VER:-n/a}"
 printf '  %-16s %s\n' "Docker Buildx"   "${BUILDX_VER:-n/a}"
 printf '  %-16s %s\n' "Release channel" "$CHANNEL"
 printf '  %-16s %s\n' "Log driver"      "$LOG_DRIVER"
+printf '  %-16s %s\n' "Target user"     "$REAL_USER"
 printf '  %-16s %s\n' "Installer"       "v${INSTALLER_VERSION} (docs ${DOCS_CHECKED})"
 
 printf '  %-16s ' "Daemon status"
